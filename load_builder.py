@@ -49,6 +49,20 @@ TRUCK_TRY_ORDER = ["34T", "30T", "14T", "8T"]
 SITE_ALIAS = {"SFP_LSM": "LSM", "SFP_WSM": "WSM"}
 SITE_SWAP = {"LSM": "WSM", "WSM": "LSM"}
 
+COMPASS_POINTS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def group_label(group_value):
+    """Human-readable label for a group key: a compass bearing range for
+    direction mode (int bucket), or the province code as-is for province mode."""
+    if isinstance(group_value, int):
+        lo = group_value * DIRECTION_DEGREES
+        hi = lo + DIRECTION_DEGREES
+        compass = COMPASS_POINTS[int(((lo + hi) / 2 % 360) / 22.5) % 16]
+        return "%d°-%d° (%s)" % (lo, hi, compass)
+    return str(group_value)
+
 
 def load_workbook_data(source=None):
     wb = openpyxl.load_workbook(source or INPUT_FILE, data_only=True)
@@ -241,7 +255,7 @@ OVERHANG_ALLOW = 0.15
 
 
 def _new_trailer_state():
-    return {"bays": [], "used_length": 0.0, "used_weight": 0.0, "placements": []}
+    return {"bays": [], "used_length": 0.0, "used_weight": 0.0, "used_volume": 0.0, "placements": []}
 
 
 def _try_place_unit(state, trailer_spec, u):
@@ -264,6 +278,7 @@ def _try_place_unit(state, trailer_spec, u):
                u["bundle_length_m"] <= support_len * (1 + OVERHANG_ALLOW):
                 stack.append(u)
                 state["used_weight"] += u["bundle_kg"]
+                state["used_volume"] += u.get("bundle_cubes_m3", 0)
                 state["placements"].append({"bay": bay["idx"], "slot": slot_idx,
                                              "x": bay["start_x"], "level": len(stack) - 1, **u})
                 return True
@@ -276,6 +291,7 @@ def _try_place_unit(state, trailer_spec, u):
         state["bays"].append(bay)
         state["used_length"] += u["bundle_length_m"]
         state["used_weight"] += u["bundle_kg"]
+        state["used_volume"] += u.get("bundle_cubes_m3", 0)
         state["placements"].append({"bay": bay_idx, "slot": 0, "x": bay["start_x"], "level": 0, **u})
         return True
     return False
@@ -298,27 +314,32 @@ def pack_trailer(trailer_spec, bundles):
     for u in units:
         if not _try_place_unit(state, trailer_spec, u):
             leftover.append(u)
-    return state["placements"], leftover, state["used_length"], state["used_weight"]
+    return state["placements"], leftover, state["used_length"], state["used_weight"], state["used_volume"]
 
 
 def pack_load(load):
     spec = TRUCK_TYPES[load["truck_type"]]
     trailers = spec["trailers"]
+    total_trailer_length = sum(t["length_m"] for t in trailers)
 
     bundle_recs = []
     for ln in load["lines"]:
         bundle_recs.append({
             "bundle_length_m": ln["bundle_length_m"], "bundle_height_m": ln["bundle_height_m"],
             "bundle_width_m": ln["bundle_width_m"], "bundle_kg": ln["bundle_kg"],
+            "bundle_cubes_m3": ln["bundle_cubes_m3"],
             "bundles": ln["bundles"], "sales_order": ln["sales_order"], "sku": ln["sku"],
             "delivery_name": ln["delivery_name"], "location_code": ln["location_code"],
             "dist_km": ln["dist_km"],
         })
 
     if len(trailers) == 1:
-        placements, leftover, used_len, used_wt = pack_trailer(trailers[0], bundle_recs)
-        return {trailers[0]["name"]: {"placements": placements, "spec": trailers[0],
-                                       "used_length": used_len, "used_weight": used_wt}}, leftover
+        placements, leftover, used_len, used_wt, used_vol = pack_trailer(trailers[0], bundle_recs)
+        return {trailers[0]["name"]: {
+            "placements": placements, "spec": trailers[0],
+            "used_length": used_len, "used_weight": used_wt, "used_volume": used_vol,
+            "cube_cap_m3": spec["cube_cap_m3"],
+        }}, leftover
 
     # Two trailers (34T): bias closer-to-site customers into the front trailer
     # (empties first / drop 1) and farther customers into the rear trailer, but
@@ -346,11 +367,19 @@ def pack_load(load):
             continue
         leftover.append(u)
 
+    # Cube capacity isn't split by trailer in the source data (only a single
+    # truck-level total), so approximate each trailer's share proportional to
+    # its length -- both trailers share the same width/height on a 34T truck.
+    front_cube_cap = spec["cube_cap_m3"] * front_spec["length_m"] / total_trailer_length
+    rear_cube_cap = spec["cube_cap_m3"] * rear_spec["length_m"] / total_trailer_length
+
     return {
         "front": {"placements": front_state["placements"], "spec": front_spec,
-                  "used_length": front_state["used_length"], "used_weight": front_state["used_weight"]},
+                  "used_length": front_state["used_length"], "used_weight": front_state["used_weight"],
+                  "used_volume": front_state["used_volume"], "cube_cap_m3": front_cube_cap},
         "rear": {"placements": rear_state["placements"], "spec": rear_spec,
-                 "used_length": rear_state["used_length"], "used_weight": rear_state["used_weight"]},
+                 "used_length": rear_state["used_length"], "used_weight": rear_state["used_weight"],
+                 "used_volume": rear_state["used_volume"], "cube_cap_m3": rear_cube_cap},
     }, leftover
 
 
@@ -374,7 +403,7 @@ if __name__ == "__main__":
         total_leftover += len(leftover)
         util_m3 = load["total_m3"] / TRUCK_TYPES[load["truck_type"]]["cube_cap_m3"] * 100
         util_kg = load["total_kg"] / (TRUCK_TYPES[load["truck_type"]]["payload_cap_t"] * 1000) * 100
-        print(f"  {load['load_id']} site={load['site']} group={load['group']} truck={load['truck_type']} "
+        print(f"  {load['load_id']} site={load['site']} group={group_label(load['group'])} truck={load['truck_type']} "
               f"m3={load['total_m3']:.1f} ({util_m3:.0f}%) kg={load['total_kg']:.0f} ({util_kg:.0f}%) "
               f"drops={load['n_customers']} lines={len(load['lines'])} pack_leftover={len(leftover)}")
     print(f"\nTotal bundle units that didn't physically fit (pack_leftover): {total_leftover}")
