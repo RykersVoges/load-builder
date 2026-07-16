@@ -240,61 +240,65 @@ def assemble_loads(lines):
 OVERHANG_ALLOW = 0.15
 
 
-def pack_trailer(trailer_spec, bundles):
+def _new_trailer_state():
+    return {"bays": [], "used_length": 0.0, "used_weight": 0.0, "placements": []}
+
+
+def _try_place_unit(state, trailer_spec, u):
+    """Attempt to place one bundle unit into a trailer's running state.
+    Mutates state in place and returns True if it fit."""
     length_cap, height_cap, width_cap, weight_cap = (
         trailer_spec["length_m"], trailer_spec["height_m"],
         trailer_spec["width_m"], trailer_spec["weight_cap_t"] * 1000,
     )
+    if state["used_weight"] + u["bundle_kg"] > weight_cap:
+        return False
+    for bay in state["bays"]:
+        for slot_idx in (0, 1):
+            if slot_idx == 1 and not bay["two_wide"]:
+                continue
+            stack = bay["stacks"][slot_idx]
+            cur_height = sum(s["bundle_height_m"] for s in stack)
+            support_len = stack[-1]["bundle_length_m"] if stack else bay["base_length"]
+            if cur_height + u["bundle_height_m"] <= height_cap and \
+               u["bundle_length_m"] <= support_len * (1 + OVERHANG_ALLOW):
+                stack.append(u)
+                state["used_weight"] += u["bundle_kg"]
+                state["placements"].append({"bay": bay["idx"], "slot": slot_idx,
+                                             "x": bay["start_x"], "level": len(stack) - 1, **u})
+                return True
+    if state["used_length"] + u["bundle_length_m"] <= length_cap:
+        bay_idx = len(state["bays"])
+        two = width_cap >= 2 * u["bundle_width_m"]
+        bay = {"idx": bay_idx, "start_x": state["used_length"], "base_length": u["bundle_length_m"],
+               "two_wide": two, "stacks": [[], []]}
+        bay["stacks"][0].append(u)
+        state["bays"].append(bay)
+        state["used_length"] += u["bundle_length_m"]
+        state["used_weight"] += u["bundle_kg"]
+        state["placements"].append({"bay": bay_idx, "slot": 0, "x": bay["start_x"], "level": 0, **u})
+        return True
+    return False
+
+
+def _expand_units(bundles):
     units = []
     for b in bundles:
         for _ in range(int(b["bundles"])):
             units.append(dict(b))
     units.sort(key=lambda u: (-u["bundle_length_m"], -u["bundle_kg"]))
+    return units
 
-    bays = []
-    used_length = 0.0
-    used_weight = 0.0
-    placements = []
+
+def pack_trailer(trailer_spec, bundles):
+    """Single-trailer packer (kept for compatibility / single-trailer trucks)."""
+    units = _expand_units(bundles)
+    state = _new_trailer_state()
     leftover = []
-
     for u in units:
-        if used_weight + u["bundle_kg"] > weight_cap:
+        if not _try_place_unit(state, trailer_spec, u):
             leftover.append(u)
-            continue
-        placed = False
-        for bay in bays:
-            for slot_idx in (0, 1):
-                if slot_idx == 1 and not bay["two_wide"]:
-                    continue
-                stack = bay["stacks"][slot_idx]
-                cur_height = sum(s["bundle_height_m"] for s in stack)
-                support_len = stack[-1]["bundle_length_m"] if stack else bay["base_length"]
-                if cur_height + u["bundle_height_m"] <= height_cap and \
-                   u["bundle_length_m"] <= support_len * (1 + OVERHANG_ALLOW):
-                    stack.append(u)
-                    used_weight += u["bundle_kg"]
-                    placements.append({"bay": bay["idx"], "slot": slot_idx,
-                                        "x": bay["start_x"], "level": len(stack) - 1, **u})
-                    placed = True
-                    break
-            if placed:
-                break
-        if placed:
-            continue
-        if used_length + u["bundle_length_m"] <= length_cap:
-            bay_idx = len(bays)
-            two = width_cap >= 2 * u["bundle_width_m"]
-            bay = {"idx": bay_idx, "start_x": used_length, "base_length": u["bundle_length_m"],
-                   "two_wide": two, "stacks": [[], []]}
-            bay["stacks"][0].append(u)
-            bays.append(bay)
-            used_length += u["bundle_length_m"]
-            used_weight += u["bundle_kg"]
-            placements.append({"bay": bay_idx, "slot": 0, "x": bay["start_x"], "level": 0, **u})
-        else:
-            leftover.append(u)
-
-    return placements, leftover, used_length, used_weight
+    return state["placements"], leftover, state["used_length"], state["used_weight"]
 
 
 def pack_load(load):
@@ -316,20 +320,37 @@ def pack_load(load):
         return {trailers[0]["name"]: {"placements": placements, "spec": trailers[0],
                                        "used_length": used_len, "used_weight": used_wt}}, leftover
 
-    bundle_recs.sort(key=lambda b: b["dist_km"])
-    median_idx = max(1, len(bundle_recs) // 2)
-    front_recs = bundle_recs[:median_idx]
-    rear_recs = bundle_recs[median_idx:]
-
+    # Two trailers (34T): bias closer-to-site customers into the front trailer
+    # (empties first / drop 1) and farther customers into the rear trailer, but
+    # let a unit fall back to the OTHER trailer if its preferred one is full --
+    # otherwise a lot of freight gets stranded even when the truck as a whole
+    # still has spare capacity, purely because of a rigid 50/50 split.
     front_spec = next(t for t in trailers if t["name"] == "front")
     rear_spec = next(t for t in trailers if t["name"] == "rear")
+    front_state = _new_trailer_state()
+    rear_state = _new_trailer_state()
 
-    fp, fl, fu_len, fu_wt = pack_trailer(front_spec, front_recs)
-    rp, rl, ru_len, ru_wt = pack_trailer(rear_spec, rear_recs + fl)
-    leftover = rl
+    units = _expand_units(bundle_recs)  # longest/heaviest first -- stability rule
+    dists = sorted(u["dist_km"] for u in units)
+    median_dist = dists[len(dists) // 2] if dists else 0
+
+    leftover = []
+    for u in units:
+        if u["dist_km"] <= median_dist:
+            preferred, preferred_spec, other, other_spec = front_state, front_spec, rear_state, rear_spec
+        else:
+            preferred, preferred_spec, other, other_spec = rear_state, rear_spec, front_state, front_spec
+        if _try_place_unit(preferred, preferred_spec, u):
+            continue
+        if _try_place_unit(other, other_spec, u):
+            continue
+        leftover.append(u)
+
     return {
-        "front": {"placements": fp, "spec": front_spec, "used_length": fu_len, "used_weight": fu_wt},
-        "rear": {"placements": rp, "spec": rear_spec, "used_length": ru_len, "used_weight": ru_wt},
+        "front": {"placements": front_state["placements"], "spec": front_spec,
+                  "used_length": front_state["used_length"], "used_weight": front_state["used_weight"]},
+        "rear": {"placements": rear_state["placements"], "spec": rear_spec,
+                 "used_length": rear_state["used_length"], "used_weight": rear_state["used_weight"]},
     }, leftover
 
 
