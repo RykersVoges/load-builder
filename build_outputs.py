@@ -3,10 +3,10 @@ Generates the two output Excel tabs (Loads Summary, Orders Line Summary)
 and one landscape schematic page per load (multi-page PDF), from the
 load_builder prototype's results.
 
-Schematic v3: ink-friendly (hatch patterns instead of solid fills, no big
-color blocks), legend moved to the top so trailers get the full page width,
-weight/floor/cube badges per trailer, and full order/SKU/customer text on
-every bundle.
+Schematic v4: skyline-packed placements (gap-filled, higher utilisation),
+ink-friendly hatch patterns instead of solid fills, legend at the top in
+route order (closest drop first), weight/cube/floor badges per trailer,
+full order/SKU/customer text on every bundle, and a page footer.
 """
 from collections import defaultdict
 import openpyxl
@@ -28,16 +28,31 @@ NAVY = "#1F3352"
 STEEL = "#4A6B8A"
 INK = "#1A1A1A"
 
-# Distinct customer colors used ONLY as thin borders/text accents (cheap on
-# ink); the bundle fill itself is white/very light with a black hatch pattern
-# so the whole schematic prints fine on a low-ink black & white printer.
+# Distinct customer styles used as thin borders/text accents + hatch pattern
+# (never a solid fill) so the whole schematic is cheap to print in black ink.
 ACCENTS = ["#4C78A8", "#F58518", "#54A24B", "#B2323C", "#4FA9A5",
            "#B8860B", "#7B4F9D", "#C2568B", "#8C5A2B", "#5C5C5C"]
 HATCHES = ["///", "\\\\\\", "|||", "---", "+++", "xxx", "...", "ooo", "***", "\\\\|"]
 
 
+def _drop_sequence(load):
+    """Order drops by distance from site (closest first == drop 1 / front
+    trailer, matching the loading/unloading sequence), returns
+    {location_code: (seq_no, name, min_dist_km)}."""
+    best = {}
+    for t in load["packing"].values():
+        for p in t["placements"]:
+            code = p.get("location_code")
+            d = p.get("dist_km", 0)
+            if code not in best or d < best[code][1]:
+                best[code] = (p.get("delivery_name", ""), d)
+    ordered = sorted(best.items(), key=lambda kv: kv[1][1])
+    return {code: (i + 1, name, dist) for i, (code, (name, dist)) in enumerate(ordered)}
+
+
 def _customer_style_map(load):
-    codes = sorted({p.get("location_code") for t in load["packing"].values() for p in t["placements"]})
+    seq = _drop_sequence(load)
+    codes = sorted(seq.keys(), key=lambda c: seq[c][0])
     return {code: (ACCENTS[i % len(ACCENTS)], HATCHES[i % len(HATCHES)]) for i, code in enumerate(codes)}
 
 THIN = Side(style="thin", color="000000")
@@ -154,7 +169,6 @@ def _rounded_bundle(ax, x, y, w, h, accent, hatch):
 
 
 def _badge(ax, x, y, w, h, pct, label):
-    """Ink-light badge: white fill, colored outline + text only (no solid fill)."""
     pct_clamped = max(0, min(pct, 100))
     color = "#2E7D32" if pct_clamped < 70 else ("#B8860B" if pct_clamped < 92 else "#B2323C")
     ax.add_patch(patches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=%.3f" % (h * 0.4),
@@ -163,7 +177,7 @@ def _badge(ax, x, y, w, h, pct, label):
             ha="center", color=color, fontweight="bold", zorder=4)
 
 
-def draw_trailer(ax, trailer_info, title, style_map):
+def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     spec = trailer_info["spec"]
     length_cap, height_cap = spec["length_m"], spec["height_m"]
     top_pad = height_cap * 0.55
@@ -189,7 +203,7 @@ def draw_trailer(ax, trailer_info, title, style_map):
     for wx in [length_cap * 0.18, length_cap * 0.5, length_cap * 0.82]:
         ax.add_patch(patches.Circle((wx, -0.18), 0.10, facecolor="none", edgecolor="#333333", linewidth=1.2, zorder=1))
 
-    for slot_idx, slot_label in ((0, "LOWER"), (1, "UPPER")):
+    for slot_idx, slot_label in ((0, "SLOT A"), (1, "SLOT B")):
         y0 = height_cap * 1.2 if slot_idx == 1 else 0
         ax.add_patch(patches.FancyBboxPatch((0, y0), length_cap, height_cap,
                                              boxstyle="round,pad=0,rounding_size=0.08", linewidth=1.3,
@@ -199,38 +213,42 @@ def draw_trailer(ax, trailer_info, title, style_map):
 
     for p in trailer_info["placements"]:
         y_offset = height_cap * 1.2 if p["slot"] == 1 else 0
-        placements_same_bay_slot = [q for q in trailer_info["placements"]
-                                     if q["bay"] == p["bay"] and q["slot"] == p["slot"] and q["level"] < p["level"]]
-        y = y_offset + sum(q["bundle_height_m"] for q in placements_same_bay_slot)
+        y = y_offset + p["y"]
         accent, hatch = style_map.get(p.get("location_code"), (ACCENTS[0], HATCHES[0]))
         _rounded_bundle(ax, p["x"], y, p["bundle_length_m"], p["bundle_height_m"], accent, hatch)
+        seq_no = seq_map.get(p.get("location_code"), (0, "", 0))[0]
         so_short = p["sales_order"].replace("SFP-", "").replace("-SO", "")
-        label = "%s | %s\n%s" % (so_short, p["sku"][-6:], p["delivery_name"][:20])
         h = p["bundle_height_m"]
-        fontsize = max(3.6, min(6.4, h * 16))
+        w = p["bundle_length_m"]
+        # very small bundles can't legibly hold 3 lines of text -- fall back
+        # to just the drop number (still traceable via the top legend) rather
+        # than cramming in unreadable, visually-colliding text fragments.
+        if w < 1.05 or h < 0.16:
+            label = "#%d" % seq_no
+            fontsize = max(5.5, min(8.0, min(w, h) * 22))
+        else:
+            label = "#%d  %s | %s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
+            fontsize = max(3.8, min(6.2, h * 15))
         clip_box = patches.Rectangle((p["x"], y), p["bundle_length_m"], p["bundle_height_m"], transform=ax.transData)
         ax.text(p["x"] + p["bundle_length_m"] / 2, y + p["bundle_height_m"] / 2, label,
-                ha="center", va="center", fontsize=fontsize, color=INK, fontweight="medium",
+                ha="center", va="center", fontsize=fontsize, color=INK, fontweight="bold",
                 zorder=4, linespacing=0.95, clip_path=clip_box, clip_on=True)
 
     ax.text(length_cap / 2, -0.32, "Length (m)  -->  towards rear", fontsize=7, ha="center", color="#777777")
 
 
-def _draw_top_legend(fig, load, style_map, rect):
+def _draw_top_legend(fig, load, style_map, seq_map, rect):
     ax = fig.add_axes(rect)
     ax.axis("off")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
-    names = {}
-    for t in load["packing"].values():
-        for p in t["placements"]:
-            names[p.get("location_code")] = p.get("delivery_name", "")
-    items = sorted(names.items(), key=lambda kv: kv[1])
+    items = sorted(seq_map.items(), key=lambda kv: kv[1][0])
     n = max(len(items), 1)
     per_row = min(n, 5)
     col_w = 1.0 / per_row
-    ax.text(0, 0.92, "DROPS ON THIS LOAD:", fontsize=7.5, fontweight="bold", color=NAVY, va="top")
-    for i, (code, name) in enumerate(items):
+    ax.text(0, 0.92, "DROPS ON THIS LOAD  (numbered in delivery/unload order, closest first):",
+            fontsize=7.5, fontweight="bold", color=NAVY, va="top")
+    for i, (code, (seq_no, name, dist)) in enumerate(items):
         row = i // per_row
         col = i % per_row
         x = col * col_w
@@ -239,12 +257,14 @@ def _draw_top_legend(fig, load, style_map, rect):
         ax.add_patch(patches.FancyBboxPatch((x, y - 0.12), 0.028, 0.20, boxstyle="round,pad=0,rounding_size=0.01",
                                              linewidth=1.0, edgecolor=accent, facecolor="white", hatch=hatch,
                                              clip_on=False))
-        ax.text(x + 0.045, y - 0.02, (name or code)[:28], fontsize=6.6, va="center", color="#333333")
+        ax.text(x + 0.045, y - 0.02, "#%d  %s (%.0f km)" % (seq_no, (name or code)[:24], dist),
+                fontsize=6.6, va="center", color="#333333")
 
 
 def write_schematics_pdf(loads, path):
+    n_total = len(loads)
     with PdfPages(path) as pdf:
-        for load in loads:
+        for page_no, load in enumerate(loads, start=1):
             n_trailers = len(load["packing"])
             fig = plt.figure(figsize=(11.7, 8.3))
             fig.patch.set_facecolor("white")
@@ -265,20 +285,28 @@ def write_schematics_pdf(loads, path):
                                 fontsize=9, color="#B2323C", fontweight="bold", ha="right", va="center",
                                 transform=header_ax.transAxes)
 
+            seq_map = _drop_sequence(load)
             style_map = _customer_style_map(load)
-            _draw_top_legend(fig, load, style_map, [0.01, 0.80, 0.98, 0.12])
+            _draw_top_legend(fig, load, style_map, seq_map, [0.01, 0.80, 0.98, 0.12])
 
             plot_area_width = 0.98
             names = list(load["packing"].keys())
             spans = [load["packing"][name]["spec"]["length_m"] + 0.9 for name in names]
             total_span = sum(spans)
             x_cursor = 0.01
-            trailer_top = 0.74
+            trailer_top = 0.72
             for i, name in enumerate(names):
                 w = plot_area_width * spans[i] / total_span
                 ax = fig.add_axes([x_cursor, 0.06, w - 0.02, trailer_top])
-                draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map)
+                draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map, seq_map)
                 x_cursor += w
+
+            footer_ax = fig.add_axes([0, 0, 1, 0.03])
+            footer_ax.axis("off")
+            footer_ax.text(0.99, 0.5, "Page %d of %d" % (page_no, n_total), fontsize=7.5, color="#999999",
+                            ha="right", va="center", transform=footer_ax.transAxes)
+            footer_ax.text(0.01, 0.5, "Generated load-building schematic -- verify against physical stock before dispatch",
+                            fontsize=7, color="#AAAAAA", ha="left", va="center", transform=footer_ax.transAxes)
 
             pdf.savefig(fig, orientation="landscape")
             plt.close(fig)
