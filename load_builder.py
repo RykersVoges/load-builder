@@ -3,6 +3,13 @@ Load-Building Prototype
 ========================
 Implements the logic described in the Instruction document against the
 real data in "Claude Input File.xlsx".
+
+Packing v2: uses a skyline (shelf) algorithm per trailer width-slot instead
+of a single-item-per-bay model. This means that once a shorter bundle is
+stacked on top of a longer one, the leftover floor/shelf space beside it is
+tracked as still-open and can be filled by another (later, shorter) bundle --
+closing the utilisation gaps the earlier "one item per level" model left
+behind.
 """
 import math
 from collections import defaultdict
@@ -254,47 +261,72 @@ def assemble_loads(lines):
 OVERHANG_ALLOW = 0.15
 
 
-def _new_trailer_state():
-    return {"bays": [], "used_length": 0.0, "used_weight": 0.0, "used_volume": 0.0, "placements": []}
+def _new_trailer_state(trailer_spec):
+    length_cap = trailer_spec["length_m"]
+    return {
+        "skyline": [
+            [{"x0": 0.0, "x1": length_cap, "h": 0.0}],
+            [{"x0": 0.0, "x1": length_cap, "h": 0.0}],
+        ],
+        "used_weight": 0.0, "used_volume": 0.0, "placements": [],
+    }
 
 
 def _try_place_unit(state, trailer_spec, u):
-    """Attempt to place one bundle unit into a trailer's running state.
-    Mutates state in place and returns True if it fit."""
-    length_cap, height_cap, width_cap, weight_cap = (
-        trailer_spec["length_m"], trailer_spec["height_m"],
-        trailer_spec["width_m"], trailer_spec["weight_cap_t"] * 1000,
-    )
+    """Best-fit skyline placement: finds the tightest open shelf position
+    across both width-slots. Splits the shelf so any leftover length beside
+    a shorter bundle stays open for a later (shorter) bundle to fill."""
+    height_cap = trailer_spec["height_m"]
+    weight_cap = trailer_spec["weight_cap_t"] * 1000
     if state["used_weight"] + u["bundle_kg"] > weight_cap:
         return False
-    for bay in state["bays"]:
-        for slot_idx in (0, 1):
-            if slot_idx == 1 and not bay["two_wide"]:
+
+    best = None
+    for slot_idx in (0, 1):
+        for seg_index, seg in enumerate(state["skyline"][slot_idx]):
+            seg_len = seg["x1"] - seg["x0"]
+            if seg_len <= 1e-9:
                 continue
-            stack = bay["stacks"][slot_idx]
-            cur_height = sum(s["bundle_height_m"] for s in stack)
-            support_len = stack[-1]["bundle_length_m"] if stack else bay["base_length"]
-            if cur_height + u["bundle_height_m"] <= height_cap and \
-               u["bundle_length_m"] <= support_len * (1 + OVERHANG_ALLOW):
-                stack.append(u)
-                state["used_weight"] += u["bundle_kg"]
-                state["used_volume"] += u.get("bundle_cubes_m3", 0)
-                state["placements"].append({"bay": bay["idx"], "slot": slot_idx,
-                                             "x": bay["start_x"], "level": len(stack) - 1, **u})
-                return True
-    if state["used_length"] + u["bundle_length_m"] <= length_cap:
-        bay_idx = len(state["bays"])
-        two = width_cap >= 2 * u["bundle_width_m"]
-        bay = {"idx": bay_idx, "start_x": state["used_length"], "base_length": u["bundle_length_m"],
-               "two_wide": two, "stacks": [[], []]}
-        bay["stacks"][0].append(u)
-        state["bays"].append(bay)
-        state["used_length"] += u["bundle_length_m"]
-        state["used_weight"] += u["bundle_kg"]
-        state["used_volume"] += u.get("bundle_cubes_m3", 0)
-        state["placements"].append({"bay": bay_idx, "slot": 0, "x": bay["start_x"], "level": 0, **u})
-        return True
-    return False
+            if seg["h"] + u["bundle_height_m"] > height_cap + 1e-9:
+                continue
+            on_floor = seg["h"] <= 1e-9
+            max_allowed = seg_len if on_floor else seg_len * (1 + OVERHANG_ALLOW)
+            if u["bundle_length_m"] > max_allowed + 1e-9:
+                continue
+            overhang_amt = max(0.0, u["bundle_length_m"] - seg_len)
+            resulting_height = seg["h"] + u["bundle_height_m"]
+            waste = abs(seg_len - u["bundle_length_m"])
+            score = (1 if overhang_amt > 1e-9 else 0, round(resulting_height, 4), waste)
+            if best is None or score < best[0]:
+                best = (score, slot_idx, seg_index)
+
+    if best is None:
+        return False
+
+    _, slot_idx, seg_index = best
+    seg = state["skyline"][slot_idx][seg_index]
+    x0, x1, h = seg["x0"], seg["x1"], seg["h"]
+    seg_len = x1 - x0
+    claim_len = min(u["bundle_length_m"], seg_len)
+
+    new_segments = [{"x0": x0, "x1": x0 + claim_len, "h": h + u["bundle_height_m"]}]
+    if claim_len < seg_len - 1e-9:
+        new_segments.append({"x0": x0 + claim_len, "x1": x1, "h": h})
+    state["skyline"][slot_idx][seg_index:seg_index + 1] = new_segments
+
+    state["used_weight"] += u["bundle_kg"]
+    state["used_volume"] += u.get("bundle_cubes_m3", 0)
+    state["placements"].append({"slot": slot_idx, "x": x0, "y": h, **u})
+    return True
+
+
+def _used_length(state):
+    used = 0.0
+    for slot in state["skyline"]:
+        for seg in slot:
+            if seg["h"] > 1e-9:
+                used = max(used, seg["x1"])
+    return used
 
 
 def _expand_units(bundles):
@@ -309,12 +341,12 @@ def _expand_units(bundles):
 def pack_trailer(trailer_spec, bundles):
     """Single-trailer packer (kept for compatibility / single-trailer trucks)."""
     units = _expand_units(bundles)
-    state = _new_trailer_state()
+    state = _new_trailer_state(trailer_spec)
     leftover = []
     for u in units:
         if not _try_place_unit(state, trailer_spec, u):
             leftover.append(u)
-    return state["placements"], leftover, state["used_length"], state["used_weight"], state["used_volume"]
+    return state["placements"], leftover, _used_length(state), state["used_weight"], state["used_volume"]
 
 
 def pack_load(load):
@@ -348,8 +380,8 @@ def pack_load(load):
     # still has spare capacity, purely because of a rigid 50/50 split.
     front_spec = next(t for t in trailers if t["name"] == "front")
     rear_spec = next(t for t in trailers if t["name"] == "rear")
-    front_state = _new_trailer_state()
-    rear_state = _new_trailer_state()
+    front_state = _new_trailer_state(front_spec)
+    rear_state = _new_trailer_state(rear_spec)
 
     units = _expand_units(bundle_recs)  # longest/heaviest first -- stability rule
     dists = sorted(u["dist_km"] for u in units)
@@ -375,10 +407,10 @@ def pack_load(load):
 
     return {
         "front": {"placements": front_state["placements"], "spec": front_spec,
-                  "used_length": front_state["used_length"], "used_weight": front_state["used_weight"],
+                  "used_length": _used_length(front_state), "used_weight": front_state["used_weight"],
                   "used_volume": front_state["used_volume"], "cube_cap_m3": front_cube_cap},
         "rear": {"placements": rear_state["placements"], "spec": rear_spec,
-                 "used_length": rear_state["used_length"], "used_weight": rear_state["used_weight"],
+                 "used_length": _used_length(rear_state), "used_weight": rear_state["used_weight"],
                  "used_volume": rear_state["used_volume"], "cube_cap_m3": rear_cube_cap},
     }, leftover
 
