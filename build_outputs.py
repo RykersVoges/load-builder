@@ -246,7 +246,6 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
         ax.plot([tick, tick], [-0.26, -0.20], color="#888888", linewidth=1.0, zorder=1)
         ax.text(tick, -0.48, "%g" % tick, fontsize=6.5, ha="center", color="#555555")
         tick += tick_step
-    ax.text(length_cap / 2, -0.55, "Length (m)  -->  towards rear", fontsize=7, ha="center", color="#777777")
 
 
 def _draw_top_legend(fig, load, style_map, seq_map, rect):
