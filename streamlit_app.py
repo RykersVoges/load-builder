@@ -14,7 +14,7 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v18 (17 Jul 2026)"
+APP_VERSION = "v19 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
