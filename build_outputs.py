@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v22 (17 Jul 2026)"
+APP_VERSION = "v23 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
