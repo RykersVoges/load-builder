@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v32"
+LB_VERSION = "v33"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -467,17 +467,32 @@ def _parse_demand_buckets(wb):
         c_ord = col("order")
         if c_sku is None:
             return
+        # This tab lists one header row per bucket (External ID / Shipper
+        # Reference / etc. filled in) followed by several blank-fronted
+        # "Bucket Lines/..." continuation rows for that same bucket's SKUs.
+        # There's no column literally named "order" in the real export --
+        # the bucket's own External ID *is* the Sales Order text (e.g.
+        # "SFP-000151617-SO" matches the orders tab exactly), so fall back
+        # to it as the grouping key, carrying both it and the digits
+        # forward across the blank continuation rows.
         last_order = None
+        last_bext = ""
         for r in rows[hdr_i + 1:]:
             sku = r[c_sku] if c_sku < len(r) else None
             if sku is None:
                 continue
             sku = str(sku).strip()
-            if c_ord is not None and c_ord < len(r) and r[c_ord] not in (None, ""):
-                last_order = _order_digits(r[c_ord])
+            ord_val = r[c_ord] if c_ord is not None and c_ord < len(r) else None
+            if ord_val in (None, "") and c_ord is None and c_bext is not None and c_bext < len(r):
+                ord_val = r[c_bext]
+            if ord_val not in (None, ""):
+                last_order = _order_digits(ord_val)
+            bext_val = r[c_bext] if c_bext is not None and c_bext < len(r) else None
+            if bext_val not in (None, ""):
+                last_bext = bext_val
             rec = {
                 "line_id": (r[c_lineid] if c_lineid is not None and c_lineid < len(r) else "") or "",
-                "bucket_ext": (r[c_bext] if c_bext is not None and c_bext < len(r) else "") or "",
+                "bucket_ext": last_bext,
                 "line_no": (r[c_lineno] if c_lineno is not None and c_lineno < len(r) else "") or "",
             }
             if last_order:
