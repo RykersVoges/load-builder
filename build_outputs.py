@@ -3,10 +3,12 @@ Generates the two output Excel tabs (Loads Summary, Orders Line Summary)
 and one landscape schematic page per load (multi-page PDF), from the
 load_builder prototype's results.
 
-Schematic v4: skyline-packed placements (gap-filled, higher utilisation),
-ink-friendly hatch patterns instead of solid fills, legend at the top in
-route order (closest drop first), weight/cube/floor badges per trailer,
-full order/SKU/customer text on every bundle, and a page footer.
+Schematic v5: numeric length-axis tick labels along the bottom of each
+trailer, explicit "Ord"/"SKU" tags so the two numbers on a bundle are never
+ambiguous, a white halo behind every label so hatch lines never run through
+the text, and lighter (single-pass) hatch patterns for less ink and a
+cleaner look. Legend stays at the top in route order (closest drop first);
+gap-filled skyline packing from the previous round is unchanged.
 """
 from collections import defaultdict
 import openpyxl
@@ -28,11 +30,12 @@ NAVY = "#1F3352"
 STEEL = "#4A6B8A"
 INK = "#1A1A1A"
 
-# Distinct customer styles used as thin borders/text accents + hatch pattern
-# (never a solid fill) so the whole schematic is cheap to print in black ink.
+# Distinct customer styles used as thin borders/text accents + a light hatch
+# pattern (never a solid fill) so the whole schematic is cheap to print in
+# black ink. Single-character hatch codes = sparser lines than repeated ones.
 ACCENTS = ["#4C78A8", "#F58518", "#54A24B", "#B2323C", "#4FA9A5",
            "#B8860B", "#7B4F9D", "#C2568B", "#8C5A2B", "#5C5C5C"]
-HATCHES = ["///", "\\\\\\", "|||", "---", "+++", "xxx", "...", "ooo", "***", "\\\\|"]
+HATCHES = ["/", "\\", "|", "-", "+", "x", ".", "o", "*", "\\|"]
 
 
 def _drop_sequence(load):
@@ -177,12 +180,15 @@ def _badge(ax, x, y, w, h, pct, label):
             ha="center", color=color, fontweight="bold", zorder=4)
 
 
+TEXT_HALO = dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.88)
+
+
 def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     spec = trailer_info["spec"]
     length_cap, height_cap = spec["length_m"], spec["height_m"]
     top_pad = height_cap * 0.55
     ax.set_xlim(-0.6, length_cap + 0.3)
-    ax.set_ylim(-0.35, height_cap * 2.2 + top_pad)
+    ax.set_ylim(-0.55, height_cap * 2.2 + top_pad)
     ax.axis("off")
 
     ax.text(length_cap / 2, height_cap * 2.2 + top_pad * 0.68, title,
@@ -198,10 +204,6 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     _badge(ax, 0, badge_y, badge_w, badge_h, weight_pct, "WT")
     _badge(ax, badge_w + gap, badge_y, badge_w, badge_h, cube_pct, "CUBE")
     _badge(ax, 2 * (badge_w + gap), badge_y, badge_w, badge_h, length_pct, "FLOOR")
-
-    ax.plot([-0.2, length_cap + 0.1], [-0.18, -0.18], color="#888888", linewidth=1.6, zorder=1)
-    for wx in [length_cap * 0.18, length_cap * 0.5, length_cap * 0.82]:
-        ax.add_patch(patches.Circle((wx, -0.18), 0.10, facecolor="none", edgecolor="#333333", linewidth=1.2, zorder=1))
 
     for slot_idx, slot_label in ((0, "SLOT A"), (1, "SLOT B")):
         y0 = height_cap * 1.2 if slot_idx == 1 else 0
@@ -220,21 +222,31 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
         so_short = p["sales_order"].replace("SFP-", "").replace("-SO", "")
         h = p["bundle_height_m"]
         w = p["bundle_length_m"]
-        # very small bundles can't legibly hold 3 lines of text -- fall back
-        # to just the drop number (still traceable via the top legend) rather
-        # than cramming in unreadable, visually-colliding text fragments.
         if w < 1.05 or h < 0.16:
             label = "#%d" % seq_no
             fontsize = max(5.5, min(8.0, min(w, h) * 22))
+        elif h >= 0.32:
+            label = "#%d\nOrd %s\nSKU ...%s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
+            fontsize = max(4.0, min(6.0, h * 13))
         else:
-            label = "#%d  %s | %s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
-            fontsize = max(3.8, min(6.2, h * 15))
+            label = "#%d Ord %s | SKU ...%s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
+            fontsize = max(3.8, min(5.6, h * 15))
         clip_box = patches.Rectangle((p["x"], y), p["bundle_length_m"], p["bundle_height_m"], transform=ax.transData)
         ax.text(p["x"] + p["bundle_length_m"] / 2, y + p["bundle_height_m"] / 2, label,
                 ha="center", va="center", fontsize=fontsize, color=INK, fontweight="bold",
-                zorder=4, linespacing=0.95, clip_path=clip_box, clip_on=True)
+                zorder=4, linespacing=1.0, clip_path=clip_box, clip_on=True, bbox=TEXT_HALO)
 
-    ax.text(length_cap / 2, -0.32, "Length (m)  -->  towards rear", fontsize=7, ha="center", color="#777777")
+    # numeric length-axis scale along the bottom, plus a light chassis line
+    ax.plot([-0.2, length_cap + 0.1], [-0.18, -0.18], color="#888888", linewidth=1.6, zorder=1)
+    for wx in [length_cap * 0.18, length_cap * 0.5, length_cap * 0.82]:
+        ax.add_patch(patches.Circle((wx, -0.18), 0.10, facecolor="none", edgecolor="#333333", linewidth=1.2, zorder=1))
+    tick_step = 1 if length_cap <= 8 else 2
+    tick = 0
+    while tick <= length_cap + 1e-6:
+        ax.plot([tick, tick], [-0.26, -0.20], color="#888888", linewidth=1.0, zorder=1)
+        ax.text(tick, -0.48, "%g" % tick, fontsize=6.5, ha="center", color="#555555")
+        tick += tick_step
+    ax.text(length_cap / 2, -0.55, "Length (m)  -->  towards rear", fontsize=7, ha="center", color="#777777")
 
 
 def _draw_top_legend(fig, load, style_map, seq_map, rect):
@@ -265,7 +277,6 @@ def write_schematics_pdf(loads, path):
     n_total = len(loads)
     with PdfPages(path) as pdf:
         for page_no, load in enumerate(loads, start=1):
-            n_trailers = len(load["packing"])
             fig = plt.figure(figsize=(11.7, 8.3))
             fig.patch.set_facecolor("white")
 
@@ -275,7 +286,7 @@ def write_schematics_pdf(loads, path):
                                                    facecolor=NAVY, edgecolor="none"))
             header_ax.text(0.01, 0.62, "LOAD %s" % load["load_id"], fontsize=17, fontweight="bold",
                             color=NAVY, va="center", transform=header_ax.transAxes)
-            subtitle = ("Site: %s   |   Direction: %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   %s drops, %s lines" % (
+            subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   %s drops, %s lines" % (
                 load["site"], group_label(load["group"]), load["truck_type"], load["total_m3"], load["total_kg"],
                 load["n_customers"], len(load["lines"])))
             header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
@@ -294,10 +305,10 @@ def write_schematics_pdf(loads, path):
             spans = [load["packing"][name]["spec"]["length_m"] + 0.9 for name in names]
             total_span = sum(spans)
             x_cursor = 0.01
-            trailer_top = 0.72
+            trailer_top = 0.70
             for i, name in enumerate(names):
                 w = plot_area_width * spans[i] / total_span
-                ax = fig.add_axes([x_cursor, 0.06, w - 0.02, trailer_top])
+                ax = fig.add_axes([x_cursor, 0.08, w - 0.02, trailer_top])
                 draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map, seq_map)
                 x_cursor += w
 
