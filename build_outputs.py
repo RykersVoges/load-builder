@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v27 (17 Jul 2026)"
+APP_VERSION = "v28 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -225,13 +225,22 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     _badge(ax, badge_w + gap, badge_y, badge_w, badge_h, cube_pct, "CUBE")
     _badge(ax, 2 * (badge_w + gap), badge_y, badge_w, badge_h, length_pct, "FLOOR")
 
-    for slot_idx, slot_label in ((0, "SLOT A"), (1, "SLOT B")):
+    for slot_idx, lane_label in ((0, "LEFT"), (1, "RIGHT")):
         y0 = height_cap * 1.2 if slot_idx == 1 else 0
         ax.add_patch(patches.FancyBboxPatch((0, y0), length_cap, height_cap,
                                              boxstyle="round,pad=0,rounding_size=0.08", linewidth=1.3,
                                              edgecolor=STEEL, facecolor="none", zorder=0))
-        ax.text(-0.45, y0 + height_cap / 2, slot_label, rotation=90, va="center", ha="center",
-                fontsize=7, color=STEEL, fontweight="bold")
+        # height scale (m) from the truck's own dimensions, on the left edge
+        hticks = list(range(0, int(height_cap) + 1))
+        if height_cap - int(height_cap) > 1e-9:
+            hticks.append(height_cap)
+        for hval in hticks:
+            y = y0 + hval
+            ax.plot([-0.10, 0], [y, y], color="#888888", linewidth=0.8, zorder=1)
+            ax.text(-0.16, y, "%g" % hval, fontsize=5.5, ha="right", va="center", color="#555555")
+        # lane name at the bottom-left of each lane box
+        ax.text(0, y0 - height_cap * 0.10, lane_label, fontsize=6.5, ha="left", va="top",
+                color=STEEL, fontweight="bold")
 
     for p in trailer_info["placements"]:
         y_offset = height_cap * 1.2 if p["slot"] == 1 else 0
@@ -277,13 +286,11 @@ def _draw_top_legend(fig, load, style_map, seq_map, rect):
     n = max(len(items), 1)
     per_row = min(n, 5)
     col_w = 1.0 / per_row
-    ax.text(0, 0.92, "DROPS ON THIS LOAD  (numbered in delivery/unload order, closest first):",
-            fontsize=7.5, fontweight="bold", color=NAVY, va="top")
     for i, (code, (seq_no, name, dist)) in enumerate(items):
         row = i // per_row
         col = i % per_row
         x = col * col_w
-        y = 0.55 - row * 0.55
+        y = 0.88 - row * 0.5
         accent, hatch = style_map.get(code, (ACCENTS[0], HATCHES[0]))
         ax.add_patch(patches.FancyBboxPatch((x, y - 0.12), 0.028, 0.20, boxstyle="round,pad=0,rounding_size=0.01",
                                              linewidth=1.0, edgecolor=accent, facecolor="white", hatch=hatch,
