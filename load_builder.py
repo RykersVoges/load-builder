@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v26"
+LB_VERSION = "v27"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -158,8 +158,87 @@ def _tab_columns(ws, must_have):
                      % (", ".join(must_have), ws.title))
 
 
+def _apply_truck_dimensions(wb):
+    """Read the Truck Dimensions tab (from the upload, else the reference
+    file) and override the built-in truck specs -- lengths, weights, widths,
+    heights, payload/cube caps, and bundles-across all come from the user's
+    workbook, not from hard-coded defaults."""
+    import re
+    ws = _find_sheet_or_none(wb, "truck")
+    if ws is None:
+        global _REF_WB
+        if _REF_WB is None and os.path.exists(REFERENCE_FILE):
+            _REF_WB = openpyxl.load_workbook(REFERENCE_FILE, data_only=True)
+        if _REF_WB is not None:
+            ws = _find_sheet_or_none(_REF_WB, "truck")
+    if ws is None:
+        return
+    rows = list(ws.iter_rows(values_only=True))
+    hdr_i = desc_col = None
+    for i, r in enumerate(rows):
+        for j, v in enumerate(r):
+            if _norm(v) == "descriptor":
+                hdr_i, desc_col = i, j
+                break
+        if hdr_i is not None:
+            break
+    if hdr_i is None:
+        return
+    col_truck = {}
+    for j, v in enumerate(rows[hdr_i]):
+        if j == desc_col or v is None:
+            continue
+        m = re.match(r"\s*(\d+)", str(v))
+        if m and (m.group(1) + "T") in TRUCK_TYPES:
+            col_truck[j] = m.group(1) + "T"
+    vals = {key: {} for key in col_truck.values()}
+    for r in rows[hdr_i + 1:]:
+        d = _norm(r[desc_col]) if desc_col < len(r) else ""
+        if not d:
+            continue
+        for j, key in col_truck.items():
+            vals[key][d] = r[j] if j < len(r) else None
+
+    def num(d, *words):
+        for k, v in d.items():
+            if all(w in k for w in words):
+                f = _f(v)
+                if f is not None:
+                    return f
+        return None
+
+    for key, d in vals.items():
+        spec = TRUCK_TYPES[key]
+        L1, L2 = num(d, "length", "closest"), num(d, "length", "furthe")
+        W1, W2 = num(d, "weight", "closest"), num(d, "weight", "furthe")
+        payload, cubes = num(d, "payload", "tons"), num(d, "payload", "cube")
+        wd1 = num(d, "width", "closest") or 2.5
+        wd2 = num(d, "width", "furthe") or wd1
+        h1 = num(d, "height", "closest") or 2.6
+        h2 = num(d, "height", "furthe") or h1
+        slots = int(num(d, "bundles placed") or 2)
+        if L1 is None:
+            continue
+        if L2 is not None:
+            spec["trailers"] = [
+                {"name": "front", "length_m": L1, "weight_cap_t": W1 or payload,
+                 "width_m": wd1, "height_m": h1, "width_slots": slots},
+                {"name": "rear", "length_m": L2, "weight_cap_t": W2 or payload,
+                 "width_m": wd2, "height_m": h2, "width_slots": slots},
+            ]
+        else:
+            spec["trailers"] = [
+                {"name": "single", "length_m": L1, "weight_cap_t": W1 or payload,
+                 "width_m": wd1, "height_m": h1, "width_slots": slots}]
+        if payload:
+            spec["payload_cap_t"] = payload
+        if cubes:
+            spec["cube_cap_m3"] = cubes
+
+
 def load_workbook_data(source=None):
     wb = openpyxl.load_workbook(source or INPUT_FILE, data_only=True)
+    _apply_truck_dimensions(wb)
 
     # ---- Customer Locations: carries BOTH the customers and (in its first
     # few rows, marked Location Type = FACILITY) the loading sites/mills. ----
@@ -623,11 +702,9 @@ OVERHANG_ALLOW = 0.15
 
 def _new_trailer_state(trailer_spec):
     length_cap = trailer_spec["length_m"]
+    n_slots = int(trailer_spec.get("width_slots", 2))
     return {
-        "skyline": [
-            [{"x0": 0.0, "x1": length_cap, "h": 0.0}],
-            [{"x0": 0.0, "x1": length_cap, "h": 0.0}],
-        ],
+        "skyline": [[{"x0": 0.0, "x1": length_cap, "h": 0.0}] for _ in range(n_slots)],
         "used_weight": 0.0, "used_volume": 0.0, "placements": [],
     }
 
@@ -648,7 +725,7 @@ def _try_place_unit(state, trailer_spec, u):
         return False
 
     best = None
-    for slot_idx in (0, 1):
+    for slot_idx in range(len(state["skyline"])):
         slot = state["skyline"][slot_idx]
         for i in range(len(slot)):
             if slot[i]["x1"] - slot[i]["x0"] <= 1e-9:
