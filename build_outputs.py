@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v33 (17 Jul 2026)"
+APP_VERSION = "v36 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -392,12 +392,25 @@ TEXT_HALO = dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none",
 def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     spec = trailer_info["spec"]
     length_cap, height_cap = spec["length_m"], spec["height_m"]
+    # Draw exactly as many lanes as this trailer actually has (2 for a
+    # standard tautliner, 1 for e.g. a single-stack Flat Deck) instead of
+    # always assuming 2 -- otherwise a single-lane trailer would show a
+    # phantom empty second lane.
+    n_slots = max(1, int(spec.get("width_slots", 2)))
+    lane_pitch = height_cap * 1.2
+    lanes_height = height_cap + lane_pitch * (n_slots - 1)
+    if n_slots == 2:
+        lane_names = ["LEFT", "RIGHT"]
+    elif n_slots == 1:
+        lane_names = [""]
+    else:
+        lane_names = ["LANE %d" % (i + 1) for i in range(n_slots)]
     top_pad = height_cap * 0.55
     ax.set_xlim(-0.6, length_cap + 0.3)
-    ax.set_ylim(-0.55, height_cap * 2.2 + top_pad)
+    ax.set_ylim(-0.55, lanes_height + top_pad)
     ax.axis("off")
 
-    ax.text(length_cap / 2, height_cap * 2.2 + top_pad * 0.68, title,
+    ax.text(length_cap / 2, lanes_height + top_pad * 0.68, title,
             fontsize=12, fontweight="bold", ha="center", color=NAVY)
 
     weight_pct = trailer_info["used_weight"] / (spec["weight_cap_t"] * 1000) * 100
@@ -405,14 +418,15 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
     cube_pct = trailer_info["used_volume"] / trailer_info["cube_cap_m3"] * 100 if trailer_info["cube_cap_m3"] else 0
     badge_w = length_cap * 0.30
     badge_h = top_pad * 0.20
-    badge_y = height_cap * 2.2 + top_pad * 0.10
+    badge_y = lanes_height + top_pad * 0.10
     gap = (length_cap - 3 * badge_w) / 2
     _badge(ax, 0, badge_y, badge_w, badge_h, weight_pct, "WT")
     _badge(ax, badge_w + gap, badge_y, badge_w, badge_h, cube_pct, "CUBE")
     _badge(ax, 2 * (badge_w + gap), badge_y, badge_w, badge_h, length_pct, "FLOOR")
 
-    for slot_idx, lane_label in ((0, "LEFT"), (1, "RIGHT")):
-        y0 = height_cap * 1.2 if slot_idx == 1 else 0
+    for slot_idx in range(n_slots):
+        lane_label = lane_names[slot_idx]
+        y0 = lane_pitch * slot_idx
         ax.add_patch(patches.FancyBboxPatch((0, y0), length_cap, height_cap,
                                              boxstyle="round,pad=0,rounding_size=0.08", linewidth=1.3,
                                              edgecolor=STEEL, facecolor="none", zorder=0))
@@ -425,11 +439,12 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
             ax.plot([-0.10, 0], [y, y], color="#888888", linewidth=0.8, zorder=1)
             ax.text(-0.16, y, "%g" % hval, fontsize=5.5, ha="right", va="center", color="#555555")
         # lane name rotated (reads bottom-to-top), centred on its lane box
-        ax.text(-0.62, y0 + height_cap / 2, lane_label, rotation=90, va="center", ha="center",
-                fontsize=8, color=STEEL, fontweight="bold")
+        if lane_label:
+            ax.text(-0.62, y0 + height_cap / 2, lane_label, rotation=90, va="center", ha="center",
+                    fontsize=8, color=STEEL, fontweight="bold")
 
     for p in trailer_info["placements"]:
-        y_offset = height_cap * 1.2 if p["slot"] == 1 else 0
+        y_offset = lane_pitch * p["slot"]
         y = y_offset + p["y"]
         accent, hatch = style_map.get(p.get("location_code"), (ACCENTS[0], HATCHES[0]))
         _rounded_bundle(ax, p["x"], y, p["bundle_length_m"], p["bundle_height_m"], accent, hatch)
