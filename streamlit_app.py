@@ -64,13 +64,22 @@ with st.sidebar:
         "Min volume utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
         help="Alternative dispatch threshold: % of the truck's cube capacity.")
 
+    st.subheader("Demand Buckets")
+    use_demand_buckets = st.checkbox(
+        "Include Demand Buckets / Transport Orders tab", value=True,
+        help=("Ticked (default): builds a 'Transport Orders' tab in the Excel output, matching "
+              "every SKU line back to its Demand Bucket ID from the uploaded Demand Buckets tab, "
+              "on the loading/delivery schedule set below. Untick if you only want the Loads "
+              "Summary and Orders Line Summary tabs -- no Transport Orders tab will be built at all."))
+
     to_start = st.number_input(
         "First Transport Order number", min_value=1, value=1870584, step=1,
+        disabled=not use_demand_buckets,
         help=("The Transport Orders tab numbers TOs sequentially starting here. Set it to "
               "follow on from the last TO number already in your TMS."))
 
     sched = default_schedule_cfg()
-    with st.expander("Loading & delivery schedule"):
+    with st.expander("Loading & delivery schedule", expanded=False):
         sched["offset_days"] = st.number_input(
             "Load in how many days from today", min_value=0, max_value=14, value=2,
             help="Load building today, trucks loaded this many days later.")
@@ -156,7 +165,8 @@ if uploaded is not None:
         wb = openpyxl.Workbook()
         write_loads_summary(wb, loads, unassigned)
         write_orders_summary(wb, loads, unassigned)
-        write_transport_orders(wb, loads, sites, to_start, sched)
+        if use_demand_buckets:
+            write_transport_orders(wb, loads, sites, to_start, sched)
         xlsx_buf = io.BytesIO()
         wb.save(xlsx_buf)
         xlsx_buf.seek(0)
@@ -165,6 +175,10 @@ if uploaded is not None:
             write_schematics_pdf(loads, tmp.name)
             tmp.seek(0)
             pdf_bytes = tmp.read()
+
+        tabs_note = ("Loads Summary, Orders Line Summary, Transport Orders" if use_demand_buckets
+                     else "Loads Summary, Orders Line Summary (no Transport Orders tab -- unticked above)")
+        st.caption(f"Excel tabs included: {tabs_note}")
 
         dcol1, dcol2 = st.columns(2)
         dcol1.download_button("Download Load Building Output.xlsx", xlsx_buf,
