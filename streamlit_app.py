@@ -20,10 +20,20 @@ st.caption("Upload your orders/customers/SKU/truck workbook, set your parameters
 
 with st.sidebar:
     st.header("Parameters")
-    group_mode = st.radio("Group customers by", ["Direction (degrees)", "Province"], index=0)
-    lb.GROUP_MODE = "province" if group_mode == "Province" else "direction"
-    lb.DIRECTION_DEGREES = st.number_input("Direction bucket size (degrees)", min_value=5, max_value=180, value=30, step=5,
-                                            disabled=(lb.GROUP_MODE == "province"))
+    group_mode = st.radio(
+        "Group customers by",
+        ["Adaptive (recommended)", "Direction (fixed degrees)", "Province"],
+        index=0,
+        help=("Adaptive seeds each load with the oldest-due order, then pulls in the nearest "
+              "other pending orders by direction (not a fixed degree boundary) until the truck "
+              "is as full as possible -- generally fills trucks fuller than a fixed bucket. "
+              "Direction/Province match the original fixed-bucket instructions exactly."),
+    )
+    lb.GROUP_MODE = {"Adaptive (recommended)": "adaptive", "Direction (fixed degrees)": "direction",
+                      "Province": "province"}[group_mode]
+    lb.DIRECTION_DEGREES = st.number_input(
+        "Direction bucket size (degrees)", min_value=5, max_value=180, value=30, step=5,
+        disabled=(lb.GROUP_MODE != "direction"))
     lb.MAX_DROPS_PER_LOAD = st.number_input("Max customer drops per load", min_value=1, max_value=20, value=5)
 
     st.subheader("Fleet available (number of trucks)")
@@ -50,16 +60,25 @@ if uploaded is not None:
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Loads built", len(loads))
-        col2.metric("Unassigned lines", len(unassigned))
+        col2.metric("Unassigned lines", len(unassigned),
+                     help="Delivery lines that couldn't be grouped into any viable load at all -- "
+                          "usually because no truck type in the fleet met its minimum utilisation "
+                          "for the freight left over, or the fleet ran out.")
         col3.metric("Fleet remaining", sum(fleet_left.values()))
 
         st.subheader("Loads")
+        st.caption(
+            "**Group** = the direction/area this load's customers were clustered by (a compass range for "
+            "Direction/Adaptive modes, or the province code). **Not physically placed** = bundles that were "
+            "assigned to this load on paper but didn't fit once real stacking, weight, and floor-length "
+            "constraints were simulated -- 0 is the goal; anything else needs attention before dispatch."
+        )
         rows = []
         for load in loads:
             spec = lb.TRUCK_TYPES[load["truck_type"]]
             rows.append({
                 "Load ID": load["load_id"], "Site": load["site"], "Truck": load["truck_type"],
-                "Group": load["group"], "m3": round(load["total_m3"], 1),
+                "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
                 "Vol Util %": round(load["total_m3"] / spec["cube_cap_m3"] * 100),
                 "KG": round(load["total_kg"]),
                 "Weight Util %": round(load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100),
