@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v24"
+LB_VERSION = "v26"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -536,10 +536,86 @@ def _assemble_loads_adaptive(lines):
     return loads, unassigned, fleet_left
 
 
+def _split_line(ln, n_evict):
+    """Split n_evict bundles off a line. Returns (kept_or_None, evicted)."""
+    per_b_m3 = ln["m3"] / ln["bundles"] if ln["bundles"] else 0.0
+    evicted = dict(ln)
+    evicted["bundles"] = n_evict
+    evicted["m3"] = per_b_m3 * n_evict
+    kept = None
+    if n_evict < ln["bundles"]:
+        kept = dict(ln)
+        kept["bundles"] = ln["bundles"] - n_evict
+        kept["m3"] = per_b_m3 * kept["bundles"]
+    return kept, evicted
+
+
 def assemble_loads(lines):
-    if GROUP_MODE == "adaptive":
-        return _assemble_loads_adaptive(lines)
-    return _assemble_loads_fixed(lines)
+    """Assemble loads on paper, then RECONCILE each with the physical
+    packer: any bundle that doesn't physically fit (height/floor/stack
+    limits) is evicted from that load and rolled into a fresh assembly
+    round on the remaining fleet -- so a load's paperwork always matches
+    what actually fits on the truck, and overflow freight gets its own
+    truck instead of silently falling off the plan."""
+    assemble = _assemble_loads_adaptive if GROUP_MODE == "adaptive" else _assemble_loads_fixed
+    loads, unassigned, fleet_left = assemble(lines)
+
+    all_loads = []
+    for round_no in range(6):
+        evicted_lines = []
+        kept_loads = []
+        for load in loads:
+            packing, leftover = pack_load(load)
+            if leftover:
+                evict_n = defaultdict(int)
+                for u in leftover:
+                    evict_n[(u["sales_order"], u["sku"], u["location_code"])] += 1
+                new_lines = []
+                for ln in load["lines"]:
+                    k = (ln["sales_order"], ln["sku"], ln["location_code"])
+                    n = min(evict_n.get(k, 0), ln["bundles"])
+                    if n:
+                        evict_n[k] -= n
+                        kept, ev = _split_line(ln, n)
+                        evicted_lines.append(ev)
+                        if kept:
+                            new_lines.append(kept)
+                    else:
+                        new_lines.append(ln)
+                if not new_lines:
+                    # nothing fit at all -- release the truck, unassign freight
+                    fleet_left[load["truck_type"]] += 1
+                    unassigned.extend(evicted_lines[-1:])
+                    continue
+                load["lines"] = new_lines
+                load["total_m3"] = sum(l["m3"] for l in new_lines)
+                load["total_kg"] = sum(l["bundle_kg"] * l["bundles"] for l in new_lines)
+                load["n_customers"] = len({l["location_code"] for l in new_lines})
+            kept_loads.append(load)
+        all_loads.extend(kept_loads)
+
+        if not evicted_lines:
+            break
+        if round_no == 5:
+            unassigned.extend(evicted_lines)
+            break
+
+        # assemble the evicted freight onto whatever fleet remains
+        saved = {k: TRUCK_TYPES[k]["fleet_count"] for k in TRUCK_TYPES}
+        for k in TRUCK_TYPES:
+            TRUCK_TYPES[k]["fleet_count"] = fleet_left[k]
+        try:
+            loads, more_unassigned, fleet_left = assemble(evicted_lines)
+        finally:
+            for k in TRUCK_TYPES:
+                TRUCK_TYPES[k]["fleet_count"] = saved[k]
+        unassigned.extend(more_unassigned)
+        if not loads:
+            break
+
+    for i, load in enumerate(all_loads, 1):
+        load["load_id"] = "L%03d" % i
+    return all_loads, unassigned, fleet_left
 
 
 OVERHANG_ALLOW = 0.15
@@ -556,10 +632,16 @@ def _new_trailer_state(trailer_spec):
     }
 
 
+LEVEL_TOL = 0.05   # adjacent stacks within 5 cm of the same height count as
+                   # one level surface -- loaders bridge these with dunnage
+                   # bearers, letting a long bundle lie across two stacks.
+
+
 def _try_place_unit(state, trailer_spec, u):
-    """Best-fit skyline placement: finds the tightest open shelf position
-    across both width-slots. Splits the shelf so any leftover length beside
-    a shorter bundle stays open for a later (shorter) bundle to fill."""
+    """Best-fit skyline placement. A bundle may rest within one shelf
+    segment OR span a run of consecutive near-level segments (real loading
+    practice: a 6m bundle lies across two level 3m stacks). Leftover shelf
+    length beside a shorter bundle stays open for later bundles."""
     height_cap = trailer_spec["height_m"]
     weight_cap = trailer_spec["weight_cap_t"] * 1000
     if state["used_weight"] + u["bundle_kg"] > weight_cap:
@@ -567,40 +649,52 @@ def _try_place_unit(state, trailer_spec, u):
 
     best = None
     for slot_idx in (0, 1):
-        for seg_index, seg in enumerate(state["skyline"][slot_idx]):
-            seg_len = seg["x1"] - seg["x0"]
-            if seg_len <= 1e-9:
+        slot = state["skyline"][slot_idx]
+        for i in range(len(slot)):
+            if slot[i]["x1"] - slot[i]["x0"] <= 1e-9:
                 continue
-            if seg["h"] + u["bundle_height_m"] > height_cap + 1e-9:
-                continue
-            on_floor = seg["h"] <= 1e-9
-            max_allowed = seg_len if on_floor else seg_len * (1 + OVERHANG_ALLOW)
-            if u["bundle_length_m"] > max_allowed + 1e-9:
-                continue
-            overhang_amt = max(0.0, u["bundle_length_m"] - seg_len)
-            resulting_height = seg["h"] + u["bundle_height_m"]
-            waste = abs(seg_len - u["bundle_length_m"])
-            score = (1 if overhang_amt > 1e-9 else 0, round(resulting_height, 4), waste)
-            if best is None or score < best[0]:
-                best = (score, slot_idx, seg_index)
+            base_h = slot[i]["h"]
+            j = i
+            while True:
+                span_len = slot[j]["x1"] - slot[i]["x0"]
+                h_top = max(slot[k]["h"] for k in range(i, j + 1))
+                on_floor = h_top <= 1e-9
+                max_allowed = span_len if on_floor else span_len * (1 + OVERHANG_ALLOW)
+                if (u["bundle_length_m"] <= max_allowed + 1e-9
+                        and h_top + u["bundle_height_m"] <= height_cap + 1e-9):
+                    overhang = max(0.0, u["bundle_length_m"] - span_len)
+                    waste = abs(span_len - u["bundle_length_m"])
+                    score = (1 if overhang > 1e-9 else 0,
+                             round(h_top + u["bundle_height_m"], 4), waste, j - i)
+                    if best is None or score < best[0]:
+                        best = (score, slot_idx, i, j, h_top)
+                    break  # fits on this run; extending further only adds waste
+                # too short so far -- extend across the next segment if its
+                # top is level (within dunnage tolerance) with the run's base
+                if j + 1 < len(slot) and abs(slot[j + 1]["h"] - base_h) <= LEVEL_TOL:
+                    j += 1
+                else:
+                    break
 
     if best is None:
         return False
 
-    _, slot_idx, seg_index = best
-    seg = state["skyline"][slot_idx][seg_index]
-    x0, x1, h = seg["x0"], seg["x1"], seg["h"]
-    seg_len = x1 - x0
-    claim_len = min(u["bundle_length_m"], seg_len)
+    _, slot_idx, i, j, h_top = best
+    slot = state["skyline"][slot_idx]
+    x0 = slot[i]["x0"]
+    span_len = slot[j]["x1"] - x0
+    claim_len = min(u["bundle_length_m"], span_len)
+    claim_x1 = x0 + claim_len
 
-    new_segments = [{"x0": x0, "x1": x0 + claim_len, "h": h + u["bundle_height_m"]}]
-    if claim_len < seg_len - 1e-9:
-        new_segments.append({"x0": x0 + claim_len, "x1": x1, "h": h})
-    state["skyline"][slot_idx][seg_index:seg_index + 1] = new_segments
+    new_segments = [{"x0": x0, "x1": claim_x1, "h": h_top + u["bundle_height_m"]}]
+    last = slot[j]
+    if claim_x1 < last["x1"] - 1e-9:
+        new_segments.append({"x0": claim_x1, "x1": last["x1"], "h": last["h"]})
+    slot[i:j + 1] = new_segments
 
     state["used_weight"] += u["bundle_kg"]
     state["used_volume"] += u.get("bundle_cubes_m3", 0)
-    state["placements"].append({"slot": slot_idx, "x": x0, "y": h, **u})
+    state["placements"].append({"slot": slot_idx, "x": x0, "y": h_top, **u})
     return True
 
 
@@ -692,6 +786,15 @@ def pack_load(load):
         drop_total_kg[d] += u["bundle_kg"]
         if placed_state is front_state:
             drop_front_kg[d] += u["bundle_kg"]
+
+    # Second-chance pass: placements made after a bundle first failed can
+    # create new level surfaces it now fits on -- try leftovers once more.
+    still_left = []
+    for u in leftover:
+        if _try_place_unit(rear_state, rear_spec, u) or _try_place_unit(front_state, front_spec, u):
+            continue
+        still_left.append(u)
+    leftover = still_left
 
     front_cube_cap = spec["cube_cap_m3"] * front_spec["length_m"] / total_trailer_length
     rear_cube_cap = spec["cube_cap_m3"] * rear_spec["length_m"] / total_trailer_length
