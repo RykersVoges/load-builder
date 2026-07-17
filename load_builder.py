@@ -23,12 +23,18 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v28"
+LB_VERSION = "v29"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
 GROUP_MODE = "adaptive"   # "adaptive" (recommended), "direction", or "province"
 MAX_DROPS_PER_LOAD = 10
+
+# A truck is only dispatched if the batch reaches at least ONE of these
+# utilisation thresholds (percent of that truck's payload / cube capacity).
+# The final leftover batch of freight is exempt, so nothing gets stranded.
+MIN_WT_UTIL_PCT = 75.0
+MIN_VOL_UTIL_PCT = 75.0
 
 TRUCK_TYPES = {
     "34T": {
@@ -505,7 +511,8 @@ def _choose_truck_type(batch_m3, batch_kg, fleet_left, is_last_batch):
         spec = TRUCK_TYPES[tname]
         if fleet_left[tname] <= 0:
             continue
-        meets_min = batch_t >= spec["min_weight_t"] or batch_m3 >= spec["min_vol_m3"]
+        meets_min = (batch_t >= spec["payload_cap_t"] * MIN_WT_UTIL_PCT / 100.0
+                     or batch_m3 >= spec["cube_cap_m3"] * MIN_VOL_UTIL_PCT / 100.0)
         fits = batch_t <= spec["payload_cap_t"] and batch_m3 <= spec["cube_cap_m3"]
         if fits and (meets_min or is_last_batch):
             return tname
