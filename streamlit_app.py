@@ -12,17 +12,19 @@ import streamlit as st
 import openpyxl
 
 import load_builder as lb
-from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
+from build_outputs import (write_loads_summary, write_orders_summary,
+                           write_schematics_pdf, write_transport_orders,
+                           default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v29 (17 Jul 2026)"
+APP_VERSION = "v32 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
-lb_ver = getattr(lb, "LB_VERSION", "v28 or older")
-if lb_ver != "v29":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v29. "
+lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
+if lb_ver != "v32":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v32. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v29, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v32, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -61,6 +63,38 @@ with st.sidebar:
     lb.MIN_VOL_UTIL_PCT = st.number_input(
         "Min volume utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
         help="Alternative dispatch threshold: % of the truck's cube capacity.")
+
+    to_start = st.number_input(
+        "First Transport Order number", min_value=1, value=1870584, step=1,
+        help=("The Transport Orders tab numbers TOs sequentially starting here. Set it to "
+              "follow on from the last TO number already in your TMS."))
+
+    sched = default_schedule_cfg()
+    with st.expander("Loading & delivery schedule"):
+        sched["offset_days"] = st.number_input(
+            "Load in how many days from today", min_value=0, max_value=14, value=2,
+            help="Load building today, trucks loaded this many days later.")
+        sched["duration_h"] = st.number_input(
+            "Load duration (hours)", min_value=0.5, max_value=12.0, value=2.0, step=0.5)
+        sched["spacing_h"] = st.number_input(
+            "Time between load starts (hours)", min_value=0.5, max_value=24.0, value=2.0, step=0.5,
+            help="Start of one load to the start of the next at the same site.")
+        sched["deliver_start"] = st.text_input("Delivery window opens (HH:MM)", "08:00")
+        sched["deliver_end"] = st.text_input("Delivery window closes (HH:MM)", "17:00")
+
+    for label, code in (("Weza (WSM) loading shifts", "WSM"), ("Langeni (LSM) loading shifts", "LSM")):
+        with st.expander(label):
+            s = sched["shifts"][code]
+            st.caption("Format HH:MM-HH:MM. Leave a shift BLANK if the site doesn't load then. "
+                       "A night shift ending earlier than it starts runs past midnight.")
+            s["weekday_day"] = st.text_input("Mon-Fri day shift", s["weekday_day"], key=code + "wd")
+            s["weekday_night"] = st.text_input("Mon-Fri night shift", s["weekday_night"], key=code + "wn")
+            s["sat_day"] = st.text_input("Saturday day shift", s["sat_day"], key=code + "sd")
+            s["sat_night"] = st.text_input("Saturday night shift", s["sat_night"], key=code + "sn")
+            s["sun_day"] = st.text_input("Sunday day shift", s["sun_day"], key=code + "ud")
+            s["sun_night"] = st.text_input("Sunday night shift", s["sun_night"], key=code + "un")
+            s["skip_night_days"] = st.multiselect(
+                "Days with NO night shift", DAY_ABBR, default=s["skip_night_days"], key=code + "sk")
 
     st.subheader("Fleet available (number of trucks)")
     lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=10)
@@ -122,6 +156,7 @@ if uploaded is not None:
         wb = openpyxl.Workbook()
         write_loads_summary(wb, loads, unassigned)
         write_orders_summary(wb, loads, unassigned)
+        write_transport_orders(wb, loads, sites, to_start, sched)
         xlsx_buf = io.BytesIO()
         wb.save(xlsx_buf)
         xlsx_buf.seek(0)
