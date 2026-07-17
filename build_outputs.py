@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v29 (17 Jul 2026)"
+APP_VERSION = "v32 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -73,7 +73,7 @@ def build_all():
         packing, leftover = pack_load(load)
         load["packing"] = packing
         load["pack_leftover"] = leftover
-    return loads, unassigned, fleet_left, lines
+    return loads, unassigned, fleet_left, lines, sites
 
 
 def sheet_style_print(ws, n_cols):
@@ -181,6 +181,192 @@ def write_orders_summary(wb, loads, unassigned):
     return ws
 
 
+DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def default_schedule_cfg():
+    return {
+        "offset_days": 2,      # load building today -> loading in N days
+        "duration_h": 2.0,     # how long loading one truck takes
+        "spacing_h": 2.0,      # start of one load to start of the next
+        "deliver_start": "08:00", "deliver_end": "17:00",
+        "shifts": {
+            "WSM": {"weekday_day": "06:30-16:15", "weekday_night": "18:30-04:15",
+                    "sat_day": "", "sat_night": "", "sun_day": "", "sun_night": "",
+                    "skip_night_days": ["Thu"]},
+            "LSM": {"weekday_day": "00:00-24:00", "weekday_night": "",
+                    "sat_day": "00:00-24:00", "sat_night": "",
+                    "sun_day": "00:00-24:00", "sun_night": "",
+                    "skip_night_days": []},
+        },
+    }
+
+
+def _parse_hhmm(s):
+    from datetime import time
+    s = str(s).strip()
+    if not s:
+        return None
+    if s in ("24:00", "24h00", "2400"):
+        return "MIDNIGHT_END"
+    h, m = s.split(":")
+    return time(int(h), int(m))
+
+
+def _shift_windows(site_cfg, d):
+    """Open loading windows (start_dt, end_dt) for calendar day d. A night
+    window ending earlier than it starts crosses midnight into d+1."""
+    from datetime import datetime, timedelta, time
+    wd = d.weekday()
+    if wd <= 4:
+        keys = [("weekday_day", False), ("weekday_night", True)]
+    elif wd == 5:
+        keys = [("sat_day", False), ("sat_night", True)]
+    else:
+        keys = [("sun_day", False), ("sun_night", True)]
+    wins = []
+    for key, is_night in keys:
+        raw = str(site_cfg.get(key) or "").strip()
+        if not raw or "-" not in raw:
+            continue
+        if is_night and DAY_ABBR[wd] in site_cfg.get("skip_night_days", []):
+            continue
+        a, b = raw.split("-", 1)
+        t1, t2 = _parse_hhmm(a), _parse_hhmm(b)
+        if t1 is None or t2 is None or t1 == "MIDNIGHT_END":
+            continue
+        start = datetime.combine(d, t1)
+        if t2 == "MIDNIGHT_END":
+            end = datetime.combine(d + timedelta(days=1), time(0, 0))
+        else:
+            end = datetime.combine(d, t2)
+            if end <= start:
+                end += timedelta(days=1)   # crosses midnight
+        wins.append((start, end))
+    return sorted(wins)
+
+
+def _next_loading_slot(site_cfg, not_before, dur_h):
+    """Earliest start >= not_before where a full loading of dur_h hours fits
+    inside one open shift window."""
+    from datetime import timedelta
+    dur = timedelta(hours=dur_h)
+    for day_off in range(0, 60):
+        d = (not_before.date() + timedelta(days=day_off))
+        # include yesterday's overnight windows that spill into today
+        wins = _shift_windows(site_cfg, d - timedelta(days=1)) + _shift_windows(site_cfg, d)
+        for s, e in sorted(wins):
+            start = max(s, not_before)
+            if start + dur <= e:
+                return start
+    return not_before  # no configured windows at all -- schedule anyway
+
+
+def write_transport_orders(wb, loads, sites, start_to_no=1000001, cfg=None):
+    """TMS import tab. Per load (load_reference_group TRK001, TRK002...):
+    one PICKUP transport order carrying every SKU line of the load
+    (destination = the first/closest drop), then one TO per customer drop
+    with that customer's lines. Each TO block = 1 main row, 4 window
+    'placeholder' rows (delivery days +1..+4), then remaining SKU lines.
+    Loading day = today + 2; the first load ships 07:00-09:00 and every
+    following load shifts 2 hours later. TO numbers continue sequentially
+    from start_to_no (set in the app to follow your TMS's numbering)."""
+    from datetime import date, datetime, time, timedelta
+    import load_builder as _lb
+
+    cfg = cfg or default_schedule_cfg()
+    ws = wb.create_sheet("Transport Orders")
+    headers = ["Transport Order", "Trip", "load_reference_group", "Status", "Route Type",
+               "Route Code", "Source Location", "Source Location Type", "Destination Location",
+               "Destination Location Type", "Total Weight", "Total Volume", "Total Pallets",
+               "Ship From", "Ship To", "Deliver From", "Deliver To",
+               "Windows/Ship From", "Windows/Ship To", "Windows/Deliver From", "Windows/Deliver To",
+               "Windows/Planning Priority", "Windows/Date From", "Windows/Date To", "External ID",
+               "Lines/Demand Bucket Line/id", "Lines/Demand Bucket/External ID",
+               "Lines/Demand Bucket Line/Line No", "Lines/Item Code", "Lines/Order ID",
+               "Lines/Qty", "Lines/Total volume", "Lines/Total Weight"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = BOLD
+
+    load_date = date.today() + timedelta(days=int(cfg["offset_days"]))
+    to_no = int(start_to_no)
+    del_start = _parse_hhmm(cfg["deliver_start"]) or time(8, 0)
+    del_end = _parse_hhmm(cfg["deliver_end"]) or time(17, 0)
+    site_cursor = {}   # per site: earliest datetime the next load may start
+
+    def fmt(dtv):
+        return dtv.strftime("%Y-%m-%d %H:%M")
+
+    def line_cells(ln):
+        db = getattr(_lb, "DEMAND_BUCKETS", {})
+        b = db.get((_lb._order_digits(ln["sales_order"]), ln["sku"])) or db.get(ln["sku"]) or {}
+        qty = int(round(ln["bundles"] * (ln.get("qty_nop") or 0))) or ln["bundles"]
+        return [b.get("line_id", ""), b.get("bucket_ext", ""), b.get("line_no", ""),
+                ln["sku"], "", qty, round(ln["m3"], 5), round(ln["bundle_kg"] * ln["bundles"], 3)]
+
+    for li, load in enumerate(loads):
+        site = load["site"]
+        scfg = cfg["shifts"].get(site) or {"weekday_day": "00:00-24:00",
+                                           "sat_day": "00:00-24:00", "sun_day": "00:00-24:00",
+                                           "skip_night_days": []}
+        not_before = site_cursor.get(site, datetime.combine(load_date, time(0, 0)))
+        slot = _next_loading_slot(scfg, not_before, cfg["duration_h"])
+        ship_from_dt = slot
+        ship_to_dt = slot + timedelta(hours=cfg["duration_h"])
+        site_cursor[site] = slot + timedelta(hours=cfg["spacing_h"])
+        base = ship_from_dt.date()   # windows are anchored on the actual loading day
+        sf, st_ = fmt(ship_from_dt), fmt(ship_to_dt)
+        trk = "TRK%03d" % (li + 1)
+        source = "SFP-%s - %s" % (site, sites.get(site, {}).get("name") or site)
+
+        cust_lines, cust_dist = {}, {}
+        for ln in load["lines"]:
+            cust_lines.setdefault(ln["location_code"], []).append(ln)
+            cust_dist[ln["location_code"]] = min(cust_dist.get(ln["location_code"], 1e18), ln["dist_km"])
+        drops = sorted(cust_lines, key=lambda c: cust_dist[c])
+
+        def emit(dest_code, dest_name, to_lines, ext_id):
+            nonlocal to_no
+            tot_kg = sum(l["bundle_kg"] * l["bundles"] for l in to_lines)
+            tot_m3 = sum(l["m3"] for l in to_lines)
+            tot_pal = sum(l["bundles"] for l in to_lines)
+            lcells = [line_cells(l) for l in to_lines]
+            # day-one delivery window: from loading end (or the delivery-window
+            # opening, whichever is later) until the configured closing time
+            day1_open = max(ship_to_dt, datetime.combine(base, del_start))
+            day1_close = datetime.combine(base, del_end)
+            if day1_open >= day1_close:
+                day1_open = datetime.combine(base, del_start)
+            ws.append(["TO%d" % to_no, "", trk, "Ready", "OUTBOUND", "",
+                       source, "FACILITY", "%s - %s" % (dest_code, dest_name), "CUSTOMER",
+                       round(tot_kg, 3), round(tot_m3, 5), tot_pal,
+                       sf, st_, st_, fmt(datetime.combine(base + timedelta(days=4), del_end)),
+                       sf, st_, fmt(day1_open), fmt(day1_close), "Must go",
+                       base.isoformat(), base.isoformat(), ext_id] + lcells[0])
+            for k in range(1, 5):
+                d = base + timedelta(days=k)
+                ws.append([""] * 17 + [sf, st_,
+                                       fmt(datetime.combine(d, del_start)),
+                                       fmt(datetime.combine(d, del_end)), "Must go",
+                                       base.isoformat(), d.isoformat()] + [""] * 9)
+            for lc in lcells[1:]:
+                ws.append([""] * 25 + lc)
+            to_no += 1
+
+        first = drops[0]
+        emit(first, cust_lines[first][0]["delivery_name"], load["lines"],
+             cust_lines[first][0]["sales_order"])
+        for code in drops:
+            ls = cust_lines[code]
+            emit(code, ls[0]["delivery_name"], ls, ls[0]["sales_order"])
+
+    for i in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 19
+    ws.freeze_panes = "A2"
+    return ws
+
+
 def _rounded_bundle(ax, x, y, w, h, accent, hatch):
     pad = min(w, h) * 0.05
     box = patches.FancyBboxPatch(
@@ -238,9 +424,9 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
             y = y0 + hval
             ax.plot([-0.10, 0], [y, y], color="#888888", linewidth=0.8, zorder=1)
             ax.text(-0.16, y, "%g" % hval, fontsize=5.5, ha="right", va="center", color="#555555")
-        # lane name at the bottom-left of each lane box
-        ax.text(0, y0 - height_cap * 0.10, lane_label, fontsize=6.5, ha="left", va="top",
-                color=STEEL, fontweight="bold")
+        # lane name rotated (reads bottom-to-top), centred on its lane box
+        ax.text(-0.62, y0 + height_cap / 2, lane_label, rotation=90, va="center", ha="center",
+                fontsize=8, color=STEEL, fontweight="bold")
 
     for p in trailer_info["placements"]:
         y_offset = height_cap * 1.2 if p["slot"] == 1 else 0
@@ -353,11 +539,12 @@ def write_schematics_pdf(loads, path):
 
 
 if __name__ == "__main__":
-    loads, unassigned, fleet_left, lines = build_all()
+    loads, unassigned, fleet_left, lines, sites = build_all()
 
     wb = openpyxl.Workbook()
     write_loads_summary(wb, loads, unassigned)
     write_orders_summary(wb, loads, unassigned)
+    write_transport_orders(wb, loads, sites)
     wb.save("Load Building Output.xlsx")
     print("Wrote Load Building Output.xlsx")
 
