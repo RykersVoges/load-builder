@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v29"
+LB_VERSION = "v32"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -96,6 +96,10 @@ def group_label(group_value):
 # matter what folder the server happens to run from.
 REFERENCE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_data.xlsx")
 _REF_WB = None
+
+# (sales_order_digits, sku) -> {"line_id", "bucket_ext", "line_no"} parsed
+# from the optional Demand Buckets tab; used by the Transport Orders output.
+DEMAND_BUCKETS = {}
 
 
 def _find_sheet_or_none(wb, *keywords):
@@ -343,6 +347,7 @@ def load_workbook_data(source=None):
         else:
             bundle_kg = _f(_val(r, c_kg_inc, c_kg))   # fallback: master's column
         skus[str(code).strip()] = {
+            "qty_nop": qty,
             "unit_length_mm": _f(_val(r, c_len)),
             "bundle_height_mm": _f(_val(r, c_h_inc, c_h)),
             "bundle_width_mm": _f(_val(r, c_w)),
@@ -407,7 +412,79 @@ def load_workbook_data(source=None):
             "sku": sku, "m3": m3, "m3_per_bundle": m3_bundle, "bundles": bundles,
         })
 
+    _parse_demand_buckets(wb)
+
     return sites, customers, skus, orders, excluded_collects
+
+
+def _order_digits(v):
+    """SFP-000151714-SO -> 000151714 (digits core) for tolerant matching."""
+    import re
+    m = re.findall(r"\d+", str(v or ""))
+    return max(m, key=len) if m else str(v or "").strip()
+
+
+def _parse_demand_buckets(wb):
+    """Best-effort parse of the Demand Buckets tab (upload first, then the
+    reference file). Populates DEMAND_BUCKETS keyed by (order_digits, sku)
+    and by sku alone as fallback. Never raises -- the Transport Orders tab
+    simply gets blank bucket IDs if this tab is absent or unrecognisable."""
+    global DEMAND_BUCKETS
+    DEMAND_BUCKETS = {}
+    ws = _find_sheet_or_none(wb, "demand") or _find_sheet_or_none(wb, "bucket")
+    if ws is None:
+        global _REF_WB
+        if _REF_WB is None and os.path.exists(REFERENCE_FILE):
+            _REF_WB = openpyxl.load_workbook(REFERENCE_FILE, data_only=True)
+        if _REF_WB is not None:
+            ws = _find_sheet_or_none(_REF_WB, "demand") or _find_sheet_or_none(_REF_WB, "bucket")
+    if ws is None:
+        return
+    try:
+        rows = list(ws.iter_rows(values_only=True))
+        hdr_i, cm = None, {}
+        for i, r in enumerate(rows[:12]):
+            names = [_norm(v) for v in r]
+            if any("sku" in n or "item" in n for n in names):
+                hdr_i = i
+                for j, n in enumerate(names):
+                    if n and n not in cm:
+                        cm[n] = j
+                break
+        if hdr_i is None:
+            return
+
+        def col(*words):
+            for k, j in cm.items():
+                if all(w in k for w in words):
+                    return j
+            return None
+
+        c_sku = col("sku") if col("sku") is not None else col("item")
+        c_lineno = col("line", "no") if col("line", "no") is not None else col("lineid")
+        c_lineid = col("line", "id")
+        c_bext = col("external") if col("external") is not None else col("bucket")
+        c_ord = col("order")
+        if c_sku is None:
+            return
+        last_order = None
+        for r in rows[hdr_i + 1:]:
+            sku = r[c_sku] if c_sku < len(r) else None
+            if sku is None:
+                continue
+            sku = str(sku).strip()
+            if c_ord is not None and c_ord < len(r) and r[c_ord] not in (None, ""):
+                last_order = _order_digits(r[c_ord])
+            rec = {
+                "line_id": (r[c_lineid] if c_lineid is not None and c_lineid < len(r) else "") or "",
+                "bucket_ext": (r[c_bext] if c_bext is not None and c_bext < len(r) else "") or "",
+                "line_no": (r[c_lineno] if c_lineno is not None and c_lineno < len(r) else "") or "",
+            }
+            if last_order:
+                DEMAND_BUCKETS[(last_order, sku)] = rec
+            DEMAND_BUCKETS.setdefault(sku, rec)
+    except Exception:
+        DEMAND_BUCKETS = {}
 
 
 def bearing_degrees(lat1, lon1, lat2, lon2):
@@ -461,6 +538,7 @@ def enrich_lines(orders, customers, skus, sites):
             "bundle_width_m": (sku["bundle_width_mm"] or 0) / 1000,
             "bundle_cubes_m3": sku["bundle_cubes_m3"] or 0,
             "bundle_kg": sku["bundle_kg"] or 0,
+            "qty_nop": sku.get("qty_nop") or 0,
         })
         enriched.append(line)
     return enriched
