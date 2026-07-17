@@ -14,15 +14,15 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v28 (17 Jul 2026)"
+APP_VERSION = "v29 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
-lb_ver = getattr(lb, "LB_VERSION", "v27 or older")
-if lb_ver != "v28":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v28. "
+lb_ver = getattr(lb, "LB_VERSION", "v28 or older")
+if lb_ver != "v29":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v29. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v28, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v29, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -53,6 +53,14 @@ with st.sidebar:
         help=("How far a bundle may stick out past the stack supporting it, as a % of the "
               "supporting surface's length. 0 = every bundle fully supported. Around 15% is "
               "realistic; too much risks bundles bending or tipping.")) / 100.0
+    lb.MIN_WT_UTIL_PCT = st.number_input(
+        "Min weight utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
+        help=("A truck is only sent out if its batch reaches this % of the truck's payload "
+              "OR the volume threshold below. The final leftover batch is exempt so nothing "
+              "gets stranded."))
+    lb.MIN_VOL_UTIL_PCT = st.number_input(
+        "Min volume utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
+        help="Alternative dispatch threshold: % of the truck's cube capacity.")
 
     st.subheader("Fleet available (number of trucks)")
     lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=10)
