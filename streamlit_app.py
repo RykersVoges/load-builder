@@ -14,7 +14,7 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v22 (17 Jul 2026)"
+APP_VERSION = "v23 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
@@ -55,7 +55,11 @@ uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 if uploaded is not None:
     if st.button("Build Loads", type="primary"):
         with st.spinner("Building loads..."):
-            sites, customers, skus, orders, excluded = lb.load_workbook_data(uploaded)
+            try:
+                sites, customers, skus, orders, excluded = lb.load_workbook_data(uploaded)
+            except ValueError as e:
+                st.error(f"Problem with the uploaded workbook: {e}")
+                st.stop()
             lines = lb.enrich_lines(orders, customers, skus, sites)
             loads, unassigned, fleet_left = lb.assemble_loads(lines)
             for load in loads:
