@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v36"
+LB_VERSION = "v37"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
