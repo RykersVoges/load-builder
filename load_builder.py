@@ -26,7 +26,7 @@ INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
 GROUP_MODE = "adaptive"   # "adaptive" (recommended), "direction", or "province"
-MAX_DROPS_PER_LOAD = 5
+MAX_DROPS_PER_LOAD = 10
 
 TRUCK_TYPES = {
     "34T": {
@@ -527,7 +527,9 @@ if __name__ == "__main__":
         total_leftover += len(leftover)
         util_m3 = load["total_m3"] / TRUCK_TYPES[load["truck_type"]]["cube_cap_m3"] * 100
         util_kg = load["total_kg"] / (TRUCK_TYPES[load["truck_type"]]["payload_cap_t"] * 1000) * 100
-        print(f"  {load['load_id']} site={load['site']} group={group_label(load['group'])} truck={load['truck_type']} "
-              f"m3={load['total_m3']:.1f} ({util_m3:.0f}%) kg={load['total_kg']:.0f} ({util_kg:.0f}%) "
-              f"drops={load['n_customers']} lines={len(load['lines'])} pack_leftover={len(leftover)}")
-    print(f"\nTotal bundle units that didn't physically fit (pack_leftover): {total_leftover}")
+        print("  %s site=%s group=%s truck=%s m3=%.1f (%.0f%%) kg=%.0f (%.0f%%) drops=%d not_placed=%d"
+              % (load["load_id"], load["site"], group_label(load["group"]), load["truck_type"],
+                 load["total_m3"], util_m3, load["total_kg"], util_kg,
+                 load["n_customers"], len(leftover)))
+
+    print("Total bundles not physically placed: %d" % total_leftover)
