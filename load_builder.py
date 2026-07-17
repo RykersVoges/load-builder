@@ -82,17 +82,32 @@ def group_label(group_value):
     return str(group_value)
 
 
+def _find_sheet(wb, *keywords):
+    """Find a tab whose name contains all the given keywords, ignoring
+    case, extra spaces, and small renames -- tab names get touched daily,
+    so never demand an exact match."""
+    for name in wb.sheetnames:
+        n = " ".join(str(name).strip().lower().split())
+        if all(k in n for k in keywords):
+            return wb[name]
+    raise ValueError(
+        "Could not find a tab matching %r in the uploaded workbook. "
+        "Tabs found: %s. Please make sure the workbook contains all five tabs "
+        "(Fully Allocated Orders, Customer Locations, SKU Bundle Dimensions, "
+        "Site Locations, Truck Dimensions)." % (" + ".join(keywords), ", ".join(wb.sheetnames)))
+
+
 def load_workbook_data(source=None):
     wb = openpyxl.load_workbook(source or INPUT_FILE, data_only=True)
 
-    ws = wb["Site Locations"]
+    ws = _find_sheet(wb, "site", "location")
     sites = {}
     for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
         if r[1] is None:
             continue
         sites[r[1]] = {"name": r[2], "lat": r[4], "lon": r[5]}
 
-    ws = wb["Customer Locations"]
+    ws = _find_sheet(wb, "customer", "location")
     customers = {}
     for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
         code = r[7]
@@ -103,7 +118,7 @@ def load_workbook_data(source=None):
             "lat": r[14], "lon": r[16], "province": r[21],
         }
 
-    ws = wb["SKU Bundle Dimensions"]
+    ws = _find_sheet(wb, "sku")
     skus = {}
     for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
         code = r[1]
@@ -119,7 +134,7 @@ def load_workbook_data(source=None):
 
     # Read the orders tab by HEADER NAME, not fixed column positions, so
     # adding/removing/reordering columns in the tab never breaks the app.
-    ws = wb["Fully Allocated Orders"]
+    ws = _find_sheet(wb, "order")
     all_rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
 
     def _norm(v):
