@@ -418,12 +418,14 @@ def _try_place_unit(state, trailer_spec, u):
 
 
 def _used_length(state):
-    used = 0.0
+    """Average occupied floor length across BOTH width-slots (not just the
+    furthest reach of whichever slot has the most freight in it) -- a
+    trailer with one lane full and the other lane empty is genuinely only
+    ~50% floor-utilised, not 100%, since the floor is 2 lanes wide."""
+    total = 0.0
     for slot in state["skyline"]:
-        for seg in slot:
-            if seg["h"] > 1e-9:
-                used = max(used, seg["x1"])
-    return used
+        total += sum(seg["x1"] - seg["x0"] for seg in slot if seg["h"] > 1e-9)
+    return total / len(state["skyline"])
 
 
 def _expand_units(bundles):
