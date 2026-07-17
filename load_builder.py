@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v27"
+LB_VERSION = "v28"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -768,6 +768,17 @@ def _try_place_unit(state, trailer_spec, u):
     if claim_x1 < last["x1"] - 1e-9:
         new_segments.append({"x0": claim_x1, "x1": last["x1"], "h": last["h"]})
     slot[i:j + 1] = new_segments
+
+    # merge adjacent equal-height segments so later bundles see one long
+    # continuous shelf instead of fragmented slivers (e.g. two 4.8m bundles
+    # side by side leave a single 2.4m opening, not scattered scraps)
+    merged = [slot[0]]
+    for seg in slot[1:]:
+        if abs(seg["h"] - merged[-1]["h"]) <= 1e-6:
+            merged[-1] = {"x0": merged[-1]["x0"], "x1": seg["x1"], "h": seg["h"]}
+        else:
+            merged.append(seg)
+    slot[:] = merged
 
     state["used_weight"] += u["bundle_kg"]
     state["used_volume"] += u.get("bundle_cubes_m3", 0)
