@@ -16,15 +16,15 @@ from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
                            default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v33 (17 Jul 2026)"
+APP_VERSION = "v36 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v33":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v33. "
+if lb_ver != "v36":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v36. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v33, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v36, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -42,6 +42,15 @@ with st.sidebar:
     lb.DIRECTION_DEGREES = st.number_input(
         "Direction bucket size (degrees)", min_value=5, max_value=180, value=30, step=5,
         disabled=(lb.GROUP_MODE != "direction"))
+    lb.MAX_CORRIDOR_SPREAD_DEG = st.number_input(
+        "Max corridor spread (degrees)", min_value=10, max_value=180, value=60, step=5,
+        disabled=(lb.GROUP_MODE != "adaptive"),
+        help=("Adaptive mode will never combine freight whose bearing from the site differs "
+              "from the load's seed order by more than this, no matter how empty the truck "
+              "still is. Prevents e.g. Limpopo and Cape Town freight ending up on the same "
+              "load just because they happen to share a similar-looking bearing from the site "
+              "-- a load ships under-full instead of reaching that far. Lower = tighter, more "
+              "geographically sensible loads but more (smaller) loads overall."))
     lb.MAX_DROPS_PER_LOAD = st.number_input(
         "Max customer drops per load", min_value=1, max_value=20, value=10,
         help=("Raising this lets adaptive mode pull more nearby orders into the same truck "
@@ -57,12 +66,15 @@ with st.sidebar:
               "realistic; too much risks bundles bending or tipping.")) / 100.0
     lb.MIN_WT_UTIL_PCT = st.number_input(
         "Min weight utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
-        help=("A truck is only sent out if its batch reaches this % of the truck's payload "
-              "OR the volume threshold below. The final leftover batch is exempt so nothing "
-              "gets stranded."))
+        help=("Only affects WHICH TRUCK SIZE gets picked when more than one type still has "
+              "fleet available -- it prefers a truck this batch fills well. It does NOT strand "
+              "freight: as long as some enabled truck type still has fleet left and the batch "
+              "physically fits, that truck is used regardless of this %. Freight only goes "
+              "unassigned when every enabled truck type has run out, or the batch is too big "
+              "for even the largest one."))
     lb.MIN_VOL_UTIL_PCT = st.number_input(
         "Min volume utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
-        help="Alternative dispatch threshold: % of the truck's cube capacity.")
+        help="Alternative dispatch threshold: % of the truck's cube capacity (same caveat as above).")
 
     st.subheader("Demand Buckets")
     use_demand_buckets = st.checkbox(
@@ -106,10 +118,24 @@ with st.sidebar:
                 "Days with NO night shift", DAY_ABBR, default=s["skip_night_days"], key=code + "sk")
 
     st.subheader("Fleet available (number of trucks)")
-    lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=10)
+    lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=20)
+    lb.TRUCK_TYPES["FD"]["fleet_count"] = st.number_input(
+        "Flat Deck", min_value=0, value=0,
+        help=("Dimensions/capacity come from the 'Flat Deck' column in the uploaded Truck "
+              "Dimensions tab if present, otherwise a placeholder spec is used. Set to 0 if you "
+              "don't have any."))
     lb.TRUCK_TYPES["30T"]["fleet_count"] = st.number_input("30 Ton Tri Axle Tautliner", min_value=0, value=0)
     lb.TRUCK_TYPES["14T"]["fleet_count"] = st.number_input("14 Ton Tautliner", min_value=0, value=0)
     lb.TRUCK_TYPES["8T"]["fleet_count"] = st.number_input("8 Ton Tautliner", min_value=0, value=0)
+
+    build_everything = st.checkbox(
+        "Build every load regardless of fleet size (decide what to dispatch afterward)", value=True,
+        help=("Ticked (default): for any truck type above with at least 1 truck entered, the "
+              "builder assumes as many of THAT type as needed are available, so every delivery "
+              "line ends up in some load -- nothing goes unassigned just because the fleet count "
+              "above ran out. Review the utilisation numbers below and decide which loads to "
+              "actually dispatch. Untick to see a realistic plan limited to the exact truck "
+              "counts entered above."))
 
 uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 
@@ -122,7 +148,18 @@ if uploaded is not None:
                 st.error(f"Problem with the uploaded workbook: {e}")
                 st.stop()
             lines = lb.enrich_lines(orders, customers, skus, sites)
-            loads, unassigned, fleet_left = lb.assemble_loads(lines)
+
+            saved_fleet = {k: lb.TRUCK_TYPES[k]["fleet_count"] for k in lb.TRUCK_TYPES}
+            if build_everything:
+                for k in lb.TRUCK_TYPES:
+                    if saved_fleet[k] > 0:
+                        lb.TRUCK_TYPES[k]["fleet_count"] = 9999
+            try:
+                loads, unassigned, fleet_left = lb.assemble_loads(lines)
+            finally:
+                for k in lb.TRUCK_TYPES:
+                    lb.TRUCK_TYPES[k]["fleet_count"] = saved_fleet[k]
+
             for load in loads:
                 packing, leftover = lb.pack_load(load)
                 load["packing"] = packing
@@ -135,9 +172,11 @@ if uploaded is not None:
         col1.metric("Loads built", len(loads))
         col2.metric("Unassigned lines", len(unassigned),
                      help="Delivery lines that couldn't be grouped into any viable load at all -- "
-                          "usually because no truck type in the fleet met its minimum utilisation "
-                          "for the freight left over, or the fleet ran out.")
-        col3.metric("Fleet remaining", sum(fleet_left.values()))
+                          "either no enabled truck type could physically fit this freight, or (if "
+                          "'Build every load regardless of fleet size' is unticked) the fleet you "
+                          "entered above ran out.")
+        col3.metric("Fleet remaining",
+                     "Ignored (unlimited)" if build_everything else sum(fleet_left.values()))
 
         st.subheader("Loads")
         st.caption(
@@ -161,6 +200,40 @@ if uploaded is not None:
                 "Not physically placed": len(load["pack_leftover"]),
             })
         st.dataframe(rows, use_container_width=True)
+
+        with st.expander("Try a different truck type for one load"):
+            st.caption(
+                "Pick a load and an alternate truck type to see what its utilisation would look "
+                "like on that truck instead -- a quick comparison, not a change to the export below."
+            )
+            pcol1, pcol2, pcol3 = st.columns([2, 2, 1])
+            sel_load_id = pcol1.selectbox("Load", [l["load_id"] for l in loads], key="preview_load")
+            sel_truck = pcol2.selectbox("Truck type to try", list(lb.TRUCK_TYPES.keys()), key="preview_truck")
+            if pcol3.button("Preview", key="preview_btn"):
+                target = next(l for l in loads if l["load_id"] == sel_load_id)
+                trial = dict(target)
+                trial["truck_type"] = sel_truck
+                packing, leftover = lb.pack_load(trial)
+                spec = lb.TRUCK_TYPES[sel_truck]
+                vol_pct = trial["total_m3"] / spec["cube_cap_m3"] * 100
+                wt_pct = trial["total_kg"] / (spec["payload_cap_t"] * 1000) * 100
+                total_b = sum(ln["bundles"] for ln in trial["lines"])
+                placed_b = total_b - len(leftover)
+                orig_spec = lb.TRUCK_TYPES[target["truck_type"]]
+                orig_vol_pct = target["total_m3"] / orig_spec["cube_cap_m3"] * 100
+                orig_wt_pct = target["total_kg"] / (orig_spec["payload_cap_t"] * 1000) * 100
+                st.write(
+                    f"**{sel_load_id}** currently on a **{target['truck_type']}**: "
+                    f"{orig_vol_pct:.0f}% volume, {orig_wt_pct:.0f}% weight."
+                )
+                st.write(
+                    f"On a **{sel_truck}** instead: {vol_pct:.0f}% volume, {wt_pct:.0f}% weight, "
+                    f"{placed_b}/{total_b} bundles would physically fit"
+                    + (f" ({len(leftover)} would not)." if leftover else " (all of them).")
+                )
+                if leftover:
+                    st.warning(f"{len(leftover)} bundle(s) would not physically fit on a {sel_truck} -- "
+                               "floor length, weight, or stacking limits exceeded.")
 
         wb = openpyxl.Workbook()
         write_loads_summary(wb, loads, unassigned)
