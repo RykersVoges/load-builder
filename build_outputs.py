@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v16 (17 Jul 2026)"
+APP_VERSION = "v17 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -93,7 +93,7 @@ def write_loads_summary(wb, loads, unassigned):
     headers = ["Load ID", "Site", "Truck Type", "Direction/Area Group",
                "Total m3", "Vol Util %", "Total KG", "Weight Util %",
                "# Orders", "Full/Partial", "# Unique SKUs", "# Customers/Drops",
-               "Bundles Not Placed (packing)"]
+               "# Bundles Placed", "Bundles Not Placed (packing)"]
     ws.append(headers)
     for c in ws[1]:
         c.font = BOLD
@@ -121,9 +121,11 @@ def write_loads_summary(wb, loads, unassigned):
             full_flags.append("Full" if is_full else "Partial")
         full_partial = "Full" if all(f == "Full" for f in full_flags) else "Partial"
         leftover_n = len(load.get("pack_leftover", []))
+        total_bundles = sum(ln["bundles"] for ln in load["lines"])
         row = [load["load_id"], load["site"], load["truck_type"], group_label(load["group"]),
                round(load["total_m3"], 2), round(vol_util, 0), round(load["total_kg"], 0), round(wt_util, 0),
-               len(so_set), full_partial, len(sku_set), len(cust_set), leftover_n]
+               len(so_set), full_partial, len(sku_set), len(cust_set),
+               total_bundles - leftover_n, leftover_n]
         ws.append(row)
         for c in ws[ws.max_row]:
             c.border = BORDER
@@ -287,15 +289,16 @@ def write_schematics_pdf(loads, path):
                                                    facecolor=NAVY, edgecolor="none"))
             header_ax.text(0.01, 0.62, "LOAD %s" % load["load_id"], fontsize=17, fontweight="bold",
                             color=NAVY, va="center", transform=header_ax.transAxes)
-            subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   %s drops, %s lines" % (
+            n_orders = len({ln["sales_order"] for ln in load["lines"]})
+            n_skus = len({ln["sku"] for ln in load["lines"]})
+            total_bundles = sum(ln["bundles"] for ln in load["lines"])
+            placed_bundles = total_bundles - len(load["pack_leftover"])
+            subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   "
+                        "%s orders, %s SKUs, %s drops, %s lines   |   %d/%d bundles placed" % (
                 load["site"], group_label(load["group"]), load["truck_type"], load["total_m3"], load["total_kg"],
-                load["n_customers"], len(load["lines"])))
+                n_orders, n_skus, load["n_customers"], len(load["lines"]), placed_bundles, total_bundles))
             header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
                             transform=header_ax.transAxes)
-            if load["pack_leftover"]:
-                header_ax.text(0.99, 0.5, "WARNING: %d bundle(s) could not be placed" % len(load["pack_leftover"]),
-                                fontsize=9, color="#B2323C", fontweight="bold", ha="right", va="center",
-                                transform=header_ax.transAxes)
 
             seq_map = _drop_sequence(load)
             style_map = _customer_style_map(load)
