@@ -16,15 +16,15 @@ from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
                            default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v36 (17 Jul 2026)"
+APP_VERSION = "v37 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v36":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v36. "
+if lb_ver != "v37":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v37. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v36, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v37, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -139,125 +139,153 @@ with st.sidebar:
 
 uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 
-if uploaded is not None:
-    if st.button("Build Loads", type="primary"):
-        with st.spinner("Building loads..."):
-            try:
-                sites, customers, skus, orders, excluded = lb.load_workbook_data(uploaded)
-            except ValueError as e:
-                st.error(f"Problem with the uploaded workbook: {e}")
-                st.stop()
-            lines = lb.enrich_lines(orders, customers, skus, sites)
+# Build results live in session_state, NOT inside the button's if-block --
+# in Streamlit, EVERY widget interaction (including clicking a button
+# further down the page) reruns the whole script, and a plain
+# "if st.button(...)" only reads True on the exact run it was clicked. If
+# the results were nested inside that block, clicking anything below them
+# (like a truck-type override) would make the button re-evaluate to False
+# and the entire page would appear to reset. Storing the result means it
+# keeps rendering on every later rerun until a new "Build Loads" click
+# replaces it.
+if uploaded is not None and st.button("Build Loads", type="primary"):
+    with st.spinner("Building loads..."):
+        try:
+            sites, customers, skus, orders, excluded = lb.load_workbook_data(uploaded)
+        except ValueError as e:
+            st.error(f"Problem with the uploaded workbook: {e}")
+            st.stop()
+        lines = lb.enrich_lines(orders, customers, skus, sites)
 
-            saved_fleet = {k: lb.TRUCK_TYPES[k]["fleet_count"] for k in lb.TRUCK_TYPES}
-            if build_everything:
-                for k in lb.TRUCK_TYPES:
-                    if saved_fleet[k] > 0:
-                        lb.TRUCK_TYPES[k]["fleet_count"] = 9999
-            try:
-                loads, unassigned, fleet_left = lb.assemble_loads(lines)
-            finally:
-                for k in lb.TRUCK_TYPES:
-                    lb.TRUCK_TYPES[k]["fleet_count"] = saved_fleet[k]
+        saved_fleet = {k: lb.TRUCK_TYPES[k]["fleet_count"] for k in lb.TRUCK_TYPES}
+        if build_everything:
+            for k in lb.TRUCK_TYPES:
+                if saved_fleet[k] > 0:
+                    lb.TRUCK_TYPES[k]["fleet_count"] = 9999
+        try:
+            loads, unassigned, fleet_left = lb.assemble_loads(lines)
+        finally:
+            for k in lb.TRUCK_TYPES:
+                lb.TRUCK_TYPES[k]["fleet_count"] = saved_fleet[k]
 
-            for load in loads:
-                packing, leftover = lb.pack_load(load)
-                load["packing"] = packing
-                load["pack_leftover"] = leftover
-
-        st.success(f"Built {len(loads)} loads from {len(lines)} delivery lines "
-                   f"({excluded} collects excluded). {len(unassigned)} lines could not be placed.")
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Loads built", len(loads))
-        col2.metric("Unassigned lines", len(unassigned),
-                     help="Delivery lines that couldn't be grouped into any viable load at all -- "
-                          "either no enabled truck type could physically fit this freight, or (if "
-                          "'Build every load regardless of fleet size' is unticked) the fleet you "
-                          "entered above ran out.")
-        col3.metric("Fleet remaining",
-                     "Ignored (unlimited)" if build_everything else sum(fleet_left.values()))
-
-        st.subheader("Loads")
-        st.caption(
-            "**Group** = the direction/area this load's customers were clustered by (a compass range for "
-            "Direction/Adaptive modes, or the province code). **Not physically placed** = bundles that were "
-            "assigned to this load on paper but didn't fit once real stacking, weight, and floor-length "
-            "constraints were simulated -- 0 is the goal; anything else needs attention before dispatch."
-        )
-        rows = []
         for load in loads:
-            spec = lb.TRUCK_TYPES[load["truck_type"]]
-            total_bundles = sum(ln["bundles"] for ln in load["lines"])
-            rows.append({
-                "Load ID": load["load_id"], "Site": load["site"], "Truck": load["truck_type"],
-                "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
-                "Vol Util %": round(load["total_m3"] / spec["cube_cap_m3"] * 100),
-                "KG": round(load["total_kg"]),
-                "Weight Util %": round(load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100),
-                "Drops": load["n_customers"], "Lines": len(load["lines"]),
-                "Bundles placed": total_bundles - len(load["pack_leftover"]),
-                "Not physically placed": len(load["pack_leftover"]),
-            })
-        st.dataframe(rows, use_container_width=True)
+            packing, leftover = lb.pack_load(load)
+            load["packing"] = packing
+            load["pack_leftover"] = leftover
 
-        with st.expander("Try a different truck type for one load"):
-            st.caption(
-                "Pick a load and an alternate truck type to see what its utilisation would look "
-                "like on that truck instead -- a quick comparison, not a change to the export below."
-            )
-            pcol1, pcol2, pcol3 = st.columns([2, 2, 1])
-            sel_load_id = pcol1.selectbox("Load", [l["load_id"] for l in loads], key="preview_load")
-            sel_truck = pcol2.selectbox("Truck type to try", list(lb.TRUCK_TYPES.keys()), key="preview_truck")
-            if pcol3.button("Preview", key="preview_btn"):
-                target = next(l for l in loads if l["load_id"] == sel_load_id)
-                trial = dict(target)
-                trial["truck_type"] = sel_truck
-                packing, leftover = lb.pack_load(trial)
-                spec = lb.TRUCK_TYPES[sel_truck]
-                vol_pct = trial["total_m3"] / spec["cube_cap_m3"] * 100
-                wt_pct = trial["total_kg"] / (spec["payload_cap_t"] * 1000) * 100
-                total_b = sum(ln["bundles"] for ln in trial["lines"])
-                placed_b = total_b - len(leftover)
-                orig_spec = lb.TRUCK_TYPES[target["truck_type"]]
-                orig_vol_pct = target["total_m3"] / orig_spec["cube_cap_m3"] * 100
-                orig_wt_pct = target["total_kg"] / (orig_spec["payload_cap_t"] * 1000) * 100
-                st.write(
-                    f"**{sel_load_id}** currently on a **{target['truck_type']}**: "
-                    f"{orig_vol_pct:.0f}% volume, {orig_wt_pct:.0f}% weight."
-                )
-                st.write(
-                    f"On a **{sel_truck}** instead: {vol_pct:.0f}% volume, {wt_pct:.0f}% weight, "
-                    f"{placed_b}/{total_b} bundles would physically fit"
-                    + (f" ({len(leftover)} would not)." if leftover else " (all of them).")
-                )
-                if leftover:
-                    st.warning(f"{len(leftover)} bundle(s) would not physically fit on a {sel_truck} -- "
-                               "floor length, weight, or stacking limits exceeded.")
+    st.session_state["result"] = {
+        "loads": loads, "unassigned": unassigned, "fleet_left": fleet_left,
+        "lines": lines, "sites": sites, "excluded": excluded,
+        "build_everything": build_everything,
+    }
 
-        wb = openpyxl.Workbook()
-        write_loads_summary(wb, loads, unassigned)
-        write_orders_summary(wb, loads, unassigned)
-        if use_demand_buckets:
-            write_transport_orders(wb, loads, sites, to_start, sched)
-        xlsx_buf = io.BytesIO()
-        wb.save(xlsx_buf)
-        xlsx_buf.seek(0)
+if "result" in st.session_state:
+    res = st.session_state["result"]
+    loads = res["loads"]
+    unassigned = res["unassigned"]
+    fleet_left = res["fleet_left"]
+    lines = res["lines"]
+    sites = res["sites"]
+    excluded = res["excluded"]
+    build_everything_used = res["build_everything"]
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-            write_schematics_pdf(loads, tmp.name)
-            tmp.seek(0)
-            pdf_bytes = tmp.read()
+    st.success(f"Built {len(loads)} loads from {len(lines)} delivery lines "
+               f"({excluded} collects excluded). {len(unassigned)} lines could not be placed.")
 
-        tabs_note = ("Loads Summary, Orders Line Summary, Transport Orders" if use_demand_buckets
-                     else "Loads Summary, Orders Line Summary (no Transport Orders tab -- unticked above)")
-        st.caption(f"Excel tabs included: {tabs_note}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Loads built", len(loads))
+    col2.metric("Unassigned lines", len(unassigned),
+                 help="Delivery lines that couldn't be grouped into any viable load at all -- "
+                      "either no enabled truck type could physically fit this freight, or (if "
+                      "'Build every load regardless of fleet size' is unticked) the fleet you "
+                      "entered above ran out.")
+    col3.metric("Fleet remaining",
+                 "Ignored (unlimited)" if build_everything_used else sum(fleet_left.values()))
 
-        dcol1, dcol2 = st.columns(2)
-        dcol1.download_button("Download Load Building Output.xlsx", xlsx_buf,
-                               file_name="Load Building Output.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        dcol2.download_button("Download Load Schematics.pdf", pdf_bytes,
-                               file_name="Load Schematics.pdf", mime="application/pdf")
-else:
+    st.subheader("Loads")
+    st.caption(
+        "**Group** = the direction/area this load's customers were clustered by (a compass range for "
+        "Direction/Adaptive modes, or the province code). **Not physically placed** = bundles that were "
+        "assigned to this load on paper but didn't fit once real stacking, weight, and floor-length "
+        "constraints were simulated -- 0 is the goal; anything else needs attention before dispatch."
+    )
+    rows = []
+    for load in loads:
+        spec = lb.TRUCK_TYPES[load["truck_type"]]
+        total_bundles = sum(ln["bundles"] for ln in load["lines"])
+        rows.append({
+            "Load ID": load["load_id"], "Site": load["site"], "Truck": load["truck_type"],
+            "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
+            "Vol Util %": round(load["total_m3"] / spec["cube_cap_m3"] * 100),
+            "KG": round(load["total_kg"]),
+            "Weight Util %": round(load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100),
+            "Drops": load["n_customers"], "Lines": len(load["lines"]),
+            "Bundles placed": total_bundles - len(load["pack_leftover"]),
+            "Not physically placed": len(load["pack_leftover"]),
+        })
+    st.dataframe(rows, width="stretch")
+
+    st.subheader("Adjust truck type per load (optional)")
+    st.caption(
+        "Set a different truck type for as many loads as you like below, then click 'Rebuild with "
+        "these truck types' once -- it re-simulates packing for every changed load and updates the "
+        "table above and both downloads below in one go. Nothing changes until you click Rebuild."
+    )
+    truck_options = list(lb.TRUCK_TYPES.keys())
+    override_rows = [{"Load ID": l["load_id"], "Site": l["site"], "Truck type": l["truck_type"]}
+                      for l in loads]
+    edited = st.data_editor(
+        override_rows,
+        column_config={
+            "Load ID": st.column_config.TextColumn("Load ID", disabled=True),
+            "Site": st.column_config.TextColumn("Site", disabled=True),
+            "Truck type": st.column_config.SelectboxColumn("Truck type", options=truck_options, required=True),
+        },
+        hide_index=True, width="stretch", key="truck_override_editor",
+    )
+    if st.button("Rebuild with these truck types"):
+        id_to_truck = {r["Load ID"]: r["Truck type"] for r in edited}
+        warnings = []
+        for load in loads:
+            new_truck = id_to_truck.get(load["load_id"], load["truck_type"])
+            load["truck_type"] = new_truck
+            packing, leftover = lb.pack_load(load)
+            load["packing"] = packing
+            load["pack_leftover"] = leftover
+            if leftover:
+                warnings.append((load["load_id"], new_truck, len(leftover)))
+        st.session_state["result"]["loads"] = loads
+        if warnings:
+            details = "; ".join(f"{lid} on {t}: {n} bundle(s) would not fit" for lid, t, n in warnings)
+            st.warning(f"Rebuilt -- but some bundles no longer physically fit: {details}. "
+                       "Consider a bigger truck for those loads, or move some freight to another load.")
+        else:
+            st.success("Rebuilt -- every bundle still physically fits with your chosen truck types.")
+        st.rerun()
+
+    wb = openpyxl.Workbook()
+    write_loads_summary(wb, loads, unassigned)
+    write_orders_summary(wb, loads, unassigned)
+    if use_demand_buckets:
+        write_transport_orders(wb, loads, sites, to_start, sched)
+    xlsx_buf = io.BytesIO()
+    wb.save(xlsx_buf)
+    xlsx_buf.seek(0)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+        write_schematics_pdf(loads, tmp.name)
+        tmp.seek(0)
+        pdf_bytes = tmp.read()
+
+    tabs_note = ("Loads Summary, Orders Line Summary, Transport Orders" if use_demand_buckets
+                 else "Loads Summary, Orders Line Summary (no Transport Orders tab -- unticked above)")
+    st.caption(f"Excel tabs included: {tabs_note}")
+
+    dcol1, dcol2 = st.columns(2)
+    dcol1.download_button("Download Load Building Output.xlsx", xlsx_buf,
+                           file_name="Load Building Output.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    dcol2.download_button("Download Load Schematics.pdf", pdf_bytes,
+                           file_name="Load Schematics.pdf", mime="application/pdf")
+elif uploaded is None:
     st.info("Upload your workbook above to get started.")
