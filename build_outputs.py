@@ -12,6 +12,8 @@ gap-filled skyline packing from the previous round is unchanged.
 """
 from collections import defaultdict
 import openpyxl
+
+APP_VERSION = "v16 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -226,10 +228,10 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
             label = "#%d" % seq_no
             fontsize = max(5.5, min(8.0, min(w, h) * 22))
         elif h >= 0.32:
-            label = "#%d\nOrd %s\nSKU ...%s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
+            label = "#%d\nOrd %s\nSKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
             fontsize = max(4.0, min(6.0, h * 13))
         else:
-            label = "#%d Ord %s | SKU ...%s\n%s" % (seq_no, so_short, p["sku"][-6:], p["delivery_name"][:20])
+            label = "#%d Ord %s | SKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
             fontsize = max(3.8, min(5.6, h * 15))
         clip_box = patches.Rectangle((p["x"], y), p["bundle_length_m"], p["bundle_height_m"], transform=ax.transData)
         ax.text(p["x"] + p["bundle_length_m"] / 2, y + p["bundle_height_m"] / 2, label,
@@ -315,6 +317,8 @@ def write_schematics_pdf(loads, path):
             footer_ax.axis("off")
             footer_ax.text(0.99, 0.5, "Page %d of %d" % (page_no, n_total), fontsize=7.5, color="#999999",
                             ha="right", va="center", transform=footer_ax.transAxes)
+            footer_ax.text(0.5, 0.5, "Build %s" % APP_VERSION, fontsize=7.5, color="#999999",
+                           ha="center", va="center")
             footer_ax.text(0.01, 0.5, "Generated load-building schematic -- verify against physical stock before dispatch",
                             fontsize=7, color="#AAAAAA", ha="left", va="center", transform=footer_ax.transAxes)
 
@@ -334,4 +338,4 @@ if __name__ == "__main__":
     write_schematics_pdf(loads, "Load Schematics.pdf")
     print("Wrote Load Schematics.pdf")
 
-    print("Summary: " + str(len(loads)) + " loads, " + str(len(unassigned)) + " unassigned lines, fleet left: " + str(fleet_left))
+    print("Summary: %d loads, %d unassigned lines, fleet left: %s" % (len(loads), len(unassigned), fleet_left))
