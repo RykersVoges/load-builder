@@ -14,9 +14,11 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
+APP_VERSION = "v16 (17 Jul 2026)"
+
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
-st.caption("Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}** -- if this version number doesn't match the latest one Claude gave you, the app is running old code.")
 
 with st.sidebar:
     st.header("Parameters")
