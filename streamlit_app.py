@@ -14,15 +14,15 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v27 (17 Jul 2026)"
+APP_VERSION = "v28 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
-lb_ver = getattr(lb, "LB_VERSION", "v26 or older")
-if lb_ver != "v27":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v27. "
+lb_ver = getattr(lb, "LB_VERSION", "v27 or older")
+if lb_ver != "v28":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v28. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v27, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v28, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -47,6 +47,12 @@ with st.sidebar:
               "your real data: 5 drops = 9 loads (highest 64.2 m3), 10 drops = 7 loads "
               "(highest 64.2 m3, 2 loads over 50 m3), 12 drops = 6 loads (3 loads over 50 m3, "
               "one at 51.4 m3). Fewer, fuller trucks."))
+
+    lb.OVERHANG_ALLOW = st.number_input(
+        "Max overhang %", min_value=0, max_value=50, value=15, step=5,
+        help=("How far a bundle may stick out past the stack supporting it, as a % of the "
+              "supporting surface's length. 0 = every bundle fully supported. Around 15% is "
+              "realistic; too much risks bundles bending or tipping.")) / 100.0
 
     st.subheader("Fleet available (number of trucks)")
     lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=10)
