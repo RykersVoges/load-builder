@@ -23,12 +23,21 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v33"
+LB_VERSION = "v36"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
 GROUP_MODE = "adaptive"   # "adaptive" (recommended), "direction", or "province"
 MAX_DROPS_PER_LOAD = 10
+
+# Hard cap on how far (in degrees of bearing from the site) adaptive mode
+# will reach to fill a truck. Bearing alone doesn't capture distance, so
+# without this cap a truck can end up combining freight in genuinely
+# unrelated directions (e.g. Limpopo and Cape Town can share a similar-
+# looking bearing from a KZN site purely by geographic coincidence) just
+# because nothing closer was left to fill the remaining space. With the
+# cap, a load ships under-full rather than reaching that far.
+MAX_CORRIDOR_SPREAD_DEG = 60
 
 # A truck is only dispatched if the batch reaches at least ONE of these
 # utilisation thresholds (percent of that truck's payload / cube capacity).
@@ -44,7 +53,17 @@ TRUCK_TYPES = {
         ],
         "payload_cap_t": 36, "cube_cap_m3": 117,
         "min_weight_t": 28, "min_vol_m3": 55,
-        "fleet_count": 10,
+        "fleet_count": 20,
+    },
+    "FD": {
+        # Flat Deck -- placeholder single-trailer spec until the uploaded
+        # Truck Dimensions tab's own "Flat Deck" column overrides these
+        # (see _apply_truck_dimensions). Defaults to 0 in the fleet so it
+        # has no effect unless the user actually owns some.
+        "trailers": [{"name": "single", "length_m": 12.5, "weight_cap_t": 34, "width_m": 2.5, "height_m": 2.6}],
+        "payload_cap_t": 34, "cube_cap_m3": 100,
+        "min_weight_t": 26, "min_vol_m3": 45,
+        "fleet_count": 0,
     },
     "30T": {
         "trailers": [{"name": "single", "length_m": 18, "weight_cap_t": 30, "width_m": 2.5, "height_m": 2.6}],
@@ -65,7 +84,7 @@ TRUCK_TYPES = {
         "fleet_count": 0,
     },
 }
-TRUCK_TRY_ORDER = ["34T", "30T", "14T", "8T"]
+TRUCK_TRY_ORDER = ["34T", "FD", "30T", "14T", "8T"]
 
 SITE_ALIAS = {"SFP_LSM": "LSM", "SFP_WSM": "WSM"}
 SITE_SWAP = {"LSM": "WSM", "WSM": "LSM"}
@@ -197,6 +216,12 @@ def _apply_truck_dimensions(wb):
     col_truck = {}
     for j, v in enumerate(rows[hdr_i]):
         if j == desc_col or v is None:
+            continue
+        header_norm = _norm(v)
+        if "flat" in header_norm and "FD" in TRUCK_TYPES:
+            # e.g. "Flat Deck", "Flatbed" -- no leading tonnage number, so
+            # match on keyword instead of the digit-prefix rule below.
+            col_truck[j] = "FD"
             continue
         m = re.match(r"\s*(\d+)", str(v))
         if m and (m.group(1) + "T") in TRUCK_TYPES:
@@ -681,7 +706,13 @@ def _assemble_loads_adaptive(lines):
         while pending:
             pending.sort(key=lambda x: (x["due"] is None, x["due"]))
             seed_bearing = pending[0]["bearing"]
-            candidates = sorted(pending, key=lambda x: _circular_angle_diff(x["bearing"], seed_bearing))
+            # Hard corridor cap: only ever consider freight within
+            # MAX_CORRIDOR_SPREAD_DEG of the seed's bearing. Freight outside
+            # that spread is left in "pending" for a later batch/load --
+            # never pulled in just to fill out this truck.
+            in_corridor = [x for x in pending
+                           if _circular_angle_diff(x["bearing"], seed_bearing) <= MAX_CORRIDOR_SPREAD_DEG]
+            candidates = sorted(in_corridor, key=lambda x: _circular_angle_diff(x["bearing"], seed_bearing))
 
             batch, batch_m3, batch_kg, custset, leftover = _greedy_fill_batch(candidates, MAX_DROPS_PER_LOAD)
             batch_ids = {id(x) for x in batch}
@@ -729,6 +760,72 @@ def _split_line(ln, n_evict):
     return kept, evicted
 
 
+def _line_fits_load_group(ln, load):
+    """Would this line be an acceptable match for an ALREADY-BUILT load,
+    under the same grouping rule that built it -- corridor spread for
+    adaptive mode, the same fixed bucket for direction/province modes?
+    Used only to decide whether evicted (physically-didn't-fit) freight
+    may be offered a spare seat on an existing load, so it never crosses
+    a corridor/province boundary just to avoid a near-empty extra truck."""
+    if load["site"] != ln["site"]:
+        return False
+    g = load["group"]
+    if isinstance(g, tuple) and g and g[0] == "adaptive":
+        _, centroid, _spread = g
+        return _circular_angle_diff(ln["bearing"], centroid) <= MAX_CORRIDOR_SPREAD_DEG
+    if GROUP_MODE == "province":
+        return g == ln["prov"]
+    return g == ln["dir_bucket"]
+
+
+def _try_salvage_into_existing(evicted_lines, kept_loads):
+    """Before spinning up a dedicated (often near-empty) new truck for
+    freight that didn't physically fit its original load (floor/stack/
+    height limits, NOT capacity -- capacity overflow is already handled
+    by folding back into the next batch during initial assembly), first
+    see if it can slot into spare room on an ALREADY-BUILT load that is
+    (a) from the same site, (b) still an acceptable match under the same
+    corridor/direction/province rule that built it, and (c) has spare
+    weight/volume/drop-count headroom. Only what genuinely can't be
+    salvaged this way falls through to a fresh assemble() round that may
+    need to build new trucks."""
+    still_evicted = []
+    for ln in evicted_lines:
+        placed = False
+        for ld in kept_loads:
+            if not _line_fits_load_group(ln, ld):
+                continue
+            spec = TRUCK_TYPES[ld["truck_type"]]
+            added_kg = ln["bundle_kg"] * ln["bundles"]
+            added_m3 = ln["m3"]
+            if ld["total_kg"] + added_kg > spec["payload_cap_t"] * 1000 + 1e-6:
+                continue
+            if ld["total_m3"] + added_m3 > spec["cube_cap_m3"] + 1e-6:
+                continue
+            cust_set = {l["location_code"] for l in ld["lines"]}
+            if ln["location_code"] not in cust_set and len(cust_set) >= MAX_DROPS_PER_LOAD:
+                continue
+
+            trial_lines = ld["lines"] + [ln]
+            trial_load = dict(ld)
+            trial_load["lines"] = trial_lines
+            packing, leftover = pack_load(trial_load)
+            if leftover:
+                continue  # doesn't actually fit once re-simulated -- try the next load
+
+            ld["lines"] = trial_lines
+            ld["total_m3"] += added_m3
+            ld["total_kg"] += added_kg
+            ld["n_customers"] = len({l["location_code"] for l in trial_lines})
+            ld["packing"] = packing
+            ld["pack_leftover"] = leftover
+            placed = True
+            break
+        if not placed:
+            still_evicted.append(ln)
+    return still_evicted
+
+
 def assemble_loads(lines):
     """Assemble loads on paper, then RECONCILE each with the physical
     packer: any bundle that doesn't physically fit (height/floor/stack
@@ -771,6 +868,10 @@ def assemble_loads(lines):
                 load["total_kg"] = sum(l["bundle_kg"] * l["bundles"] for l in new_lines)
                 load["n_customers"] = len({l["location_code"] for l in new_lines})
             kept_loads.append(load)
+
+        if evicted_lines:
+            evicted_lines = _try_salvage_into_existing(evicted_lines, kept_loads)
+
         all_loads.extend(kept_loads)
 
         if not evicted_lines:
