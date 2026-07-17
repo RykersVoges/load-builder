@@ -18,6 +18,7 @@ of a single-item-per-bay model, so leftover shelf space beside a shorter
 stacked bundle stays open for a later, shorter bundle to fill.
 """
 import math
+import os
 from collections import defaultdict
 
 import openpyxl
@@ -82,9 +83,11 @@ def group_label(group_value):
     return str(group_value)
 
 
-REFERENCE_FILE = "reference_data.xlsx"   # ships with the app; holds the
-# Customer Locations / SKU Bundle Dimensions / Site Locations / Truck
-# Dimensions tabs so the daily upload only needs the orders tab.
+# Ships with the app; holds the Customer Locations / SKU Bundle Dimensions /
+# Site Locations / Truck Dimensions reference tabs so the daily upload only
+# needs the orders tab. Resolved relative to THIS file so it's found no
+# matter what folder the server happens to run from.
+REFERENCE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_data.xlsx")
 _REF_WB = None
 
 
