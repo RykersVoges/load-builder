@@ -16,15 +16,15 @@ from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
                            default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v32 (17 Jul 2026)"
+APP_VERSION = "v33 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v32":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v32. "
+if lb_ver != "v33":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v33. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v32, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v33, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
