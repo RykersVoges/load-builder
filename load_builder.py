@@ -82,63 +82,191 @@ def group_label(group_value):
     return str(group_value)
 
 
-def _find_sheet(wb, *keywords):
-    """Find a tab whose name contains all the given keywords, ignoring
-    case, extra spaces, and small renames -- tab names get touched daily,
-    so never demand an exact match."""
+REFERENCE_FILE = "reference_data.xlsx"   # ships with the app; holds the
+# Customer Locations / SKU Bundle Dimensions / Site Locations / Truck
+# Dimensions tabs so the daily upload only needs the orders tab.
+_REF_WB = None
+
+
+def _find_sheet_or_none(wb, *keywords):
     for name in wb.sheetnames:
         n = " ".join(str(name).strip().lower().split())
         if all(k in n for k in keywords):
             return wb[name]
+    return None
+
+
+def _find_sheet(wb, *keywords, use_reference=True):
+    """Find a tab whose name contains all the given keywords, ignoring
+    case, extra spaces, and small renames. If the tab isn't in the uploaded
+    workbook and it's a reference tab (customers/SKUs/sites), fall back to
+    the reference_data.xlsx bundled with the app -- so the daily upload
+    only ever needs to contain the orders tab."""
+    ws = _find_sheet_or_none(wb, *keywords)
+    if ws is not None:
+        return ws
+    if use_reference:
+        import os
+        global _REF_WB
+        if _REF_WB is None and os.path.exists(REFERENCE_FILE):
+            _REF_WB = openpyxl.load_workbook(REFERENCE_FILE, data_only=True)
+        if _REF_WB is not None:
+            ws = _find_sheet_or_none(_REF_WB, *keywords)
+            if ws is not None:
+                return ws
     raise ValueError(
-        "Could not find a tab matching %r in the uploaded workbook. "
-        "Tabs found: %s. Please make sure the workbook contains all five tabs "
-        "(Fully Allocated Orders, Customer Locations, SKU Bundle Dimensions, "
-        "Site Locations, Truck Dimensions)." % (" + ".join(keywords), ", ".join(wb.sheetnames)))
+        "Could not find a tab matching %r in the uploaded workbook%s. "
+        "Tabs found in the upload: %s." % (
+            " + ".join(keywords),
+            " or in the app's reference data" if use_reference else "",
+            ", ".join(wb.sheetnames)))
+
+
+def _norm(v):
+    return " ".join(str(v).strip().lower().replace("³", "3").split()) if v is not None else ""
+
+
+def _f(v):
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _site_code(v):
+    """SFP-LSM / SFP_LSM / LSM all mean the Langeni mill -- normalise."""
+    return str(v).strip().upper().replace("SFP-", "").replace("SFP_", "")
+
+
+def _tab_columns(ws, must_have):
+    """Locate the header row (first row containing every name in must_have,
+    ignoring case/spacing) and return (header_row_number, {name: col_index})."""
+    limit = min(12, ws.max_row)
+    for i, r in enumerate(ws.iter_rows(min_row=1, max_row=limit, values_only=True), 1):
+        names = [_norm(v) for v in r]
+        if all(m in names for m in must_have):
+            colmap = {}
+            for j, n in enumerate(names):
+                if n and n not in colmap:
+                    colmap[n] = j
+            return i, colmap
+    raise ValueError('Could not find a header row containing [%s] on tab "%s".'
+                     % (", ".join(must_have), ws.title))
 
 
 def load_workbook_data(source=None):
     wb = openpyxl.load_workbook(source or INPUT_FILE, data_only=True)
 
-    ws = _find_sheet(wb, "site", "location")
-    sites = {}
-    for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
-        if r[1] is None:
-            continue
-        sites[r[1]] = {"name": r[2], "lat": r[4], "lon": r[5]}
-
+    # ---- Customer Locations: carries BOTH the customers and (in its first
+    # few rows, marked Location Type = FACILITY) the loading sites/mills. ----
     ws = _find_sheet(wb, "customer", "location")
-    customers = {}
-    for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
-        code = r[7]
-        if code is None:
+    hdr, cm = _tab_columns(ws, ["location code", "lat", "lon"])
+    customers, sites = {}, {}
+    for r in ws.iter_rows(min_row=hdr + 1, max_row=ws.max_row, values_only=True):
+        def g(*names):
+            for n in names:
+                j = cm.get(n)
+                if j is not None and j < len(r):
+                    return r[j]
+            return None
+        code = g("location code")
+        lat, lon = _f(g("lat")), _f(g("lon"))
+        if code is None or lat is None or lon is None:
             continue
-        customers[str(code).strip()] = {
-            "area": r[4], "city": r[6], "desc": r[10],
-            "lat": r[14], "lon": r[16], "province": r[21],
-        }
+        code_s = str(code).strip()
+        desc = g("customer description", "description")
+        if _norm(g("location type")) == "facility" or code_s.upper().startswith("SFP"):
+            sites[_site_code(code_s)] = {"name": desc, "lat": lat, "lon": lon}
+        else:
+            customers[code_s] = {
+                "area": g("area"), "city": g("city"), "desc": desc,
+                "lat": lat, "lon": lon,
+                "province": g("province name", "province", "prov"),
+            }
 
+    # ---- Site Locations tab is now OPTIONAL: if present (in the upload or
+    # the reference file), it fills in any site the FACILITY rows didn't. ----
+    ws = _find_sheet_or_none(wb, "site", "location")
+    if ws is None:
+        import os
+        global _REF_WB
+        if _REF_WB is None and os.path.exists(REFERENCE_FILE):
+            _REF_WB = openpyxl.load_workbook(REFERENCE_FILE, data_only=True)
+        if _REF_WB is not None:
+            ws = _find_sheet_or_none(_REF_WB, "site", "location")
+    if ws is not None:
+        try:
+            hdr, cm = _tab_columns(ws, ["site code", "lat", "lon"])
+            for r in ws.iter_rows(min_row=hdr + 1, max_row=ws.max_row, values_only=True):
+                code = r[cm["site code"]] if cm["site code"] < len(r) else None
+                lat, lon = _f(r[cm["lat"]]), _f(r[cm["lon"]])
+                if code is None or lat is None or lon is None:
+                    continue
+                name_j = cm.get("site")
+                sites.setdefault(_site_code(code), {
+                    "name": r[name_j] if name_j is not None else "", "lat": lat, "lon": lon})
+        except ValueError:
+            pass
+    if not sites:
+        raise ValueError(
+            "No loading sites found. Expected FACILITY rows at the top of the "
+            "Customer Locations tab, or a Site Locations tab.")
+
+    # ---- SKU Bundle Dimensions: header-name based; prefers the
+    # "incl dunnage" columns when present. ----
     ws = _find_sheet(wb, "sku")
+    hdr, cm = _tab_columns(ws, ["sku code"])
+
+    def _col_like(*words):
+        for key, j in cm.items():
+            if all(w in key for w in words):
+                return j
+        return None
+
+    c_code = cm["sku code"]
+    c_len = _col_like("unit length")
+    c_h_inc, c_h = _col_like("bundle height", "inc"), _col_like("bundle height")
+    c_w = _col_like("bundle width")
+    c_m3_inc, c_m3 = _col_like("bundle cube", "inc"), _col_like("bundle cube")
+    c_kg_inc, c_kg = _col_like("bundle kg", "inc"), _col_like("bundle kg")
+    # True payload weight = Unit Weight x Qty (NOP) + dunnage. The master's
+    # own "Bundle KG" column is density x OUTER bundle volume (including the
+    # air between boards), which overstates the timber's real weight ~15-20%.
+    c_uw = _col_like("unit weight")
+    c_qty = _col_like("qty (nop)") or _col_like("qty nop")
+    c_dun = cm.get("dunnage kg")
+
+    def _val(r, j_pref, j_base=None):
+        v = r[j_pref] if j_pref is not None and j_pref < len(r) else None
+        if v in (None, "", 0) and j_base is not None and j_base < len(r):
+            v = r[j_base]
+        return v
+
     skus = {}
-    for r in ws.iter_rows(min_row=3, max_row=ws.max_row, values_only=True):
-        code = r[1]
+    for r in ws.iter_rows(min_row=hdr + 1, max_row=ws.max_row, values_only=True):
+        code = r[c_code] if c_code < len(r) else None
         if code is None:
             continue
+        uw, qty = _f(_val(r, c_uw)), _f(_val(r, c_qty))
+        dun = _f(_val(r, c_dun)) or 0.0
+        if uw and qty:
+            bundle_kg = uw * qty + dun     # actual timber mass + dunnage
+        else:
+            bundle_kg = _f(_val(r, c_kg_inc, c_kg))   # fallback: master's column
         skus[str(code).strip()] = {
-            "unit_length_mm": r[4],
-            "bundle_height_mm": r[19] or r[11],
-            "bundle_width_mm": r[12],
-            "bundle_cubes_m3": r[20] or r[13],
-            "bundle_kg": r[21] or r[14],
+            "unit_length_mm": _f(_val(r, c_len)),
+            "bundle_height_mm": _f(_val(r, c_h_inc, c_h)),
+            "bundle_width_mm": _f(_val(r, c_w)),
+            "bundle_cubes_m3": _f(_val(r, c_m3_inc, c_m3)),
+            "bundle_kg": bundle_kg,
         }
 
     # Read the orders tab by HEADER NAME, not fixed column positions, so
     # adding/removing/reordering columns in the tab never breaks the app.
-    ws = _find_sheet(wb, "order")
+    # Orders must come from the daily upload itself -- never fall back to
+    # the reference file here, or the app would silently build yesterday's loads.
+    ws = _find_sheet(wb, "order", use_reference=False)
     all_rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
-
-    def _norm(v):
-        return str(v).strip().lower().replace("³", "3") if v is not None else ""
 
     header_idx, col = None, {}
     for i, r in enumerate(all_rows[:10]):
@@ -186,7 +314,7 @@ def load_workbook_data(source=None):
             "location_code": str(loc).strip() if loc is not None else "",
             "delivery_name": _pick(r, "delivery name"),
             "area": _pick(r, "area"), "prov": _pick(r, "prov", "province"),
-            "site_raw": site, "site": SITE_ALIAS.get(site, site),
+            "site_raw": site, "site": _site_code(site),
             "sku": sku, "m3": m3, "m3_per_bundle": m3_bundle, "bundles": bundles,
         })
 
@@ -533,20 +661,33 @@ def pack_load(load):
     rear_state = _new_trailer_state(rear_spec)
 
     units = _expand_units(bundle_recs)
-    dists = sorted(u["dist_km"] for u in units)
-    median_dist = dists[len(dists) // 2] if dists else 0
+
+    # Balanced two-trailer allocation: give every DROP a presence in BOTH
+    # trailers, in proportion to each trailer's weight capacity (1/3 front,
+    # 2/3 rear on a 34T interlink). As the route is unloaded drop by drop,
+    # both trailers then empty gradually together -- avoiding the risk case
+    # of a nearly-empty front pulling a still-full 12m rear trailer.
+    front_share = front_spec["weight_cap_t"] / (front_spec["weight_cap_t"] + rear_spec["weight_cap_t"])
+    drop_front_kg = defaultdict(float)
+    drop_total_kg = defaultdict(float)
 
     leftover = []
     for u in units:
-        if u["dist_km"] <= median_dist:
-            preferred, preferred_spec, other, other_spec = front_state, front_spec, rear_state, rear_spec
-        else:
-            preferred, preferred_spec, other, other_spec = rear_state, rear_spec, front_state, front_spec
-        if _try_place_unit(preferred, preferred_spec, u):
+        d = u["location_code"]
+        want_front = drop_front_kg[d] < front_share * (drop_total_kg[d] + u["bundle_kg"])
+        order = ((front_state, front_spec), (rear_state, rear_spec)) if want_front \
+            else ((rear_state, rear_spec), (front_state, front_spec))
+        placed_state = None
+        for st, sp in order:
+            if _try_place_unit(st, sp, u):
+                placed_state = st
+                break
+        if placed_state is None:
+            leftover.append(u)
             continue
-        if _try_place_unit(other, other_spec, u):
-            continue
-        leftover.append(u)
+        drop_total_kg[d] += u["bundle_kg"]
+        if placed_state is front_state:
+            drop_front_kg[d] += u["bundle_kg"]
 
     front_cube_cap = spec["cube_cap_m3"] * front_spec["length_m"] / total_trailer_length
     rear_cube_cap = spec["cube_cap_m3"] * rear_spec["length_m"] / total_trailer_length
