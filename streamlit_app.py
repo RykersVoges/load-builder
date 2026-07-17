@@ -14,15 +14,15 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v24 (17 Jul 2026)"
+APP_VERSION = "v26 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
-lb_ver = getattr(lb, "LB_VERSION", "v23 or older")
-if lb_ver != "v24":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v24. "
+lb_ver = getattr(lb, "LB_VERSION", "v25 or older")
+if lb_ver != "v26":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v26. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v24, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v26, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
