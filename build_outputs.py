@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v24 (17 Jul 2026)"
+APP_VERSION = "v26 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -139,26 +139,42 @@ def write_loads_summary(wb, loads, unassigned):
 def write_orders_summary(wb, loads, unassigned):
     ws = wb.create_sheet("Orders Line Summary")
     headers = ["Sales Order", "Due Date", "Customer", "Location Code", "SKU",
-               "Bundles", "m3", "KG", "Assigned Load ID", "Site", "Status"]
+               "Bundles", "Bundles Placed", "m3", "KG", "Assigned Load ID", "Site", "Status"]
     ws.append(headers)
     for c in ws[1]:
         c.font = BOLD
         c.border = BORDER
         c.alignment = Alignment(horizontal="center")
 
-    def add_row(ln, load_id, status):
+    # How many bundles of each line did NOT physically fit in the packing
+    # simulation -- so the Status column tells the truth per line, matching
+    # the schematic's "x/y bundles placed" header exactly.
+    not_placed = defaultdict(int)
+    for load in loads:
+        for u in load.get("pack_leftover", []):
+            not_placed[(load["load_id"], u["sales_order"], u["sku"], u["location_code"])] += 1
+
+    def add_row(ln, load_id, status, placed=None):
         kg = ln["bundle_kg"] * ln["bundles"]
         ws.append([ln["sales_order"], ln["due"].strftime("%Y-%m-%d") if ln["due"] else "",
                    ln["delivery_name"], ln["location_code"], ln["sku"], ln["bundles"],
+                   placed if placed is not None else 0,
                    round(ln["m3"], 2), round(kg, 1), load_id, ln["site"], status])
         for c in ws[ws.max_row]:
             c.border = BORDER
 
     for load in loads:
         for ln in load["lines"]:
-            add_row(ln, load["load_id"], "Loaded")
+            miss = not_placed.get((load["load_id"], ln["sales_order"], ln["sku"], ln["location_code"]), 0)
+            placed = ln["bundles"] - miss
+            if miss == 0:
+                add_row(ln, load["load_id"], "Loaded", placed)
+            else:
+                add_row(ln, load["load_id"],
+                        "PARTIAL -- %d of %d bundles did not fit (floor/stack limits); "
+                        "re-plan or move to another load" % (miss, ln["bundles"]), placed)
     for ln in unassigned:
-        add_row(ln, "-", "UNASSIGNED (no truck met minimum / fleet exhausted)")
+        add_row(ln, "-", "UNASSIGNED (no truck met minimum / fleet exhausted)", 0)
 
     sheet_style_print(ws, len(headers))
     ws.freeze_panes = "A2"
