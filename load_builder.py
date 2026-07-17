@@ -4,12 +4,18 @@ Load-Building Prototype
 Implements the logic described in the Instruction document against the
 real data in "Claude Input File.xlsx".
 
-Packing v2: uses a skyline (shelf) algorithm per trailer width-slot instead
-of a single-item-per-bay model. This means that once a shorter bundle is
-stacked on top of a longer one, the leftover floor/shelf space beside it is
-tracked as still-open and can be filled by another (later, shorter) bundle --
-closing the utilisation gaps the earlier "one item per level" model left
-behind.
+Assembly v2 adds an "adaptive" grouping mode: instead of pre-slicing
+customers into fixed-width direction buckets (which can strand volume that
+sits just across a bucket boundary), it seeds each new load with the
+oldest-due pending order, then greedily pulls in the geographically nearest
+other pending orders (by bearing, not a fixed bucket) until the truck is as
+full as it can be. It also does a best-effort bin-covering scan (skips an
+order that doesn't fit and keeps checking smaller ones after it, instead of
+stopping at the first that doesn't fit).
+
+Packing v2 uses a skyline (shelf) algorithm per trailer width-slot instead
+of a single-item-per-bay model, so leftover shelf space beside a shorter
+stacked bundle stays open for a later, shorter bundle to fill.
 """
 import math
 from collections import defaultdict
@@ -19,7 +25,7 @@ import openpyxl
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
-GROUP_MODE = "direction"
+GROUP_MODE = "adaptive"   # "adaptive" (recommended), "direction", or "province"
 MAX_DROPS_PER_LOAD = 5
 
 TRUCK_TYPES = {
@@ -62,7 +68,12 @@ COMPASS_POINTS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
 
 def group_label(group_value):
     """Human-readable label for a group key: a compass bearing range for
-    direction mode (int bucket), or the province code as-is for province mode."""
+    direction mode (int bucket), the province code as-is for province mode,
+    or a centroid +/- spread description for adaptive corridors."""
+    if isinstance(group_value, tuple) and group_value and group_value[0] == "adaptive":
+        _, centroid, spread = group_value
+        compass = COMPASS_POINTS[int((centroid % 360) / 22.5) % 16]
+        return "~%d° +/-%d° (%s), adaptive corridor" % (round(centroid), round(spread), compass)
     if isinstance(group_value, int):
         lo = group_value * DIRECTION_DEGREES
         hi = lo + DIRECTION_DEGREES
@@ -145,6 +156,19 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
+def _circular_angle_diff(a, b):
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def _circular_mean(angles):
+    if not angles:
+        return 0.0
+    sx = sum(math.sin(math.radians(a)) for a in angles)
+    cx = sum(math.cos(math.radians(a)) for a in angles)
+    return math.degrees(math.atan2(sx, cx)) % 360
+
+
 def enrich_lines(orders, customers, skus, sites):
     enriched = []
     for o in orders:
@@ -176,7 +200,60 @@ def group_key(line):
     return (line["site"], line["dir_bucket"])
 
 
-def assemble_loads(lines):
+# ---------------------------------------------------------------------------
+# Shared batch-filling + truck-selection helpers
+# ---------------------------------------------------------------------------
+def _greedy_fill_batch(candidates, max_drops):
+    """Best-effort bin-covering: scan candidates in priority order, add
+    whichever ones fit (skip -- don't stop -- on ones that don't), so a
+    smaller order further down the list can still fill space a bigger one
+    couldn't. Returns (batch, batch_m3, batch_kg, custset, leftover)."""
+    batch, batch_m3, batch_kg, custset = [], 0.0, 0.0, set()
+    leftover = []
+    cap_m3 = TRUCK_TYPES["34T"]["cube_cap_m3"]
+    cap_kg = TRUCK_TYPES["34T"]["payload_cap_t"] * 1000
+    for ln in candidates:
+        new_custset = custset | {ln["location_code"]}
+        would_exceed_drops = len(new_custset) > max_drops
+        would_exceed_cap = (batch_m3 + ln["m3"] > cap_m3) or (batch_kg + ln["bundle_kg"] * ln["bundles"] > cap_kg)
+        if would_exceed_drops or would_exceed_cap:
+            leftover.append(ln)
+            continue
+        batch.append(ln)
+        batch_m3 += ln["m3"]
+        batch_kg += ln["bundle_kg"] * ln["bundles"]
+        custset = new_custset
+    if not batch and candidates:
+        ln = candidates[0]
+        batch = [ln]
+        batch_m3 = ln["m3"]
+        batch_kg = ln["bundle_kg"] * ln["bundles"]
+        custset = {ln["location_code"]}
+        leftover = candidates[1:]
+    return batch, batch_m3, batch_kg, custset, leftover
+
+
+def _choose_truck_type(batch_m3, batch_kg, fleet_left, is_last_batch):
+    batch_t = batch_kg / 1000
+    for tname in TRUCK_TRY_ORDER:
+        spec = TRUCK_TYPES[tname]
+        if fleet_left[tname] <= 0:
+            continue
+        meets_min = batch_t >= spec["min_weight_t"] or batch_m3 >= spec["min_vol_m3"]
+        fits = batch_t <= spec["payload_cap_t"] and batch_m3 <= spec["cube_cap_m3"]
+        if fits and (meets_min or is_last_batch):
+            return tname
+    for tname in TRUCK_TRY_ORDER:
+        spec = TRUCK_TYPES[tname]
+        if fleet_left[tname] > 0 and batch_t <= spec["payload_cap_t"] and batch_m3 <= spec["cube_cap_m3"]:
+            return tname
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Fixed-bucket assembly (direction / province toggle, as literally specified)
+# ---------------------------------------------------------------------------
+def _assemble_loads_fixed(lines):
     fleet_left = {k: v["fleet_count"] for k, v in TRUCK_TYPES.items()}
     groups = defaultdict(list)
     for ln in lines:
@@ -191,54 +268,13 @@ def assemble_loads(lines):
         pending = list(glines)
 
         while pending:
-            batch, batch_m3, batch_kg, custset = [], 0.0, 0.0, set()
-            i = 0
-            while i < len(pending):
-                ln = pending[i]
-                new_custset = custset | {ln["location_code"]}
-                would_exceed_drops = len(new_custset) > MAX_DROPS_PER_LOAD
-                would_exceed_34t = (batch_m3 + ln["m3"] > TRUCK_TYPES["34T"]["cube_cap_m3"]) or \
-                                   (batch_kg + ln["bundle_kg"] * ln["bundles"] > TRUCK_TYPES["34T"]["payload_cap_t"] * 1000)
-                if would_exceed_drops or would_exceed_34t:
-                    break
-                batch.append(ln)
-                batch_m3 += ln["m3"]
-                batch_kg += ln["bundle_kg"] * ln["bundles"]
-                custset = new_custset
-                i += 1
-
-            if not batch:
-                ln = pending[0]
-                batch = [ln]
-                batch_m3 = ln["m3"]
-                batch_kg = ln["bundle_kg"] * ln["bundles"]
-                custset = {ln["location_code"]}
-                i = 1
-
-            remaining_after = pending[i:]
-            batch_t = batch_kg / 1000
-
-            chosen_truck = None
-            is_last_batch_in_group = len(remaining_after) == 0
-            for tname in TRUCK_TRY_ORDER:
-                spec = TRUCK_TYPES[tname]
-                if fleet_left[tname] <= 0:
-                    continue
-                meets_min = batch_t >= spec["min_weight_t"] or batch_m3 >= spec["min_vol_m3"]
-                fits = batch_t <= spec["payload_cap_t"] and batch_m3 <= spec["cube_cap_m3"]
-                if fits and (meets_min or is_last_batch_in_group):
-                    chosen_truck = tname
-                    break
-            if chosen_truck is None:
-                for tname in TRUCK_TRY_ORDER:
-                    spec = TRUCK_TYPES[tname]
-                    if fleet_left[tname] > 0 and batch_t <= spec["payload_cap_t"] and batch_m3 <= spec["cube_cap_m3"]:
-                        chosen_truck = tname
-                        break
+            batch, batch_m3, batch_kg, custset, leftover = _greedy_fill_batch(pending, MAX_DROPS_PER_LOAD)
+            is_last_batch = len(leftover) == 0
+            chosen_truck = _choose_truck_type(batch_m3, batch_kg, fleet_left, is_last_batch)
 
             if chosen_truck is None:
                 unassigned.extend(batch)
-                pending = remaining_after
+                pending = leftover
                 continue
 
             fleet_left[chosen_truck] -= 1
@@ -253,9 +289,70 @@ def assemble_loads(lines):
                 "n_customers": len(custset),
             })
             load_id_counter += 1
-            pending = remaining_after
+            pending = leftover
 
     return loads, unassigned, fleet_left
+
+
+# ---------------------------------------------------------------------------
+# Adaptive assembly: seed each load with the oldest-due pending order, then
+# pull in the nearest-bearing other pending orders (regardless of a fixed
+# bucket boundary) until the truck is as full as it can be.
+# ---------------------------------------------------------------------------
+def _assemble_loads_adaptive(lines):
+    fleet_left = {k: v["fleet_count"] for k, v in TRUCK_TYPES.items()}
+    by_site = defaultdict(list)
+    for ln in lines:
+        by_site[ln["site"]].append(ln)
+
+    loads = []
+    unassigned = []
+    load_id_counter = 1
+
+    for site, site_lines in by_site.items():
+        pending = list(site_lines)
+
+        while pending:
+            pending.sort(key=lambda x: (x["due"] is None, x["due"]))
+            seed_bearing = pending[0]["bearing"]
+            candidates = sorted(pending, key=lambda x: _circular_angle_diff(x["bearing"], seed_bearing))
+
+            batch, batch_m3, batch_kg, custset, leftover = _greedy_fill_batch(candidates, MAX_DROPS_PER_LOAD)
+            batch_ids = {id(x) for x in batch}
+            new_pending = [x for x in pending if id(x) not in batch_ids]
+            is_last_batch = len(new_pending) == 0
+
+            chosen_truck = _choose_truck_type(batch_m3, batch_kg, fleet_left, is_last_batch)
+
+            if chosen_truck is None:
+                unassigned.extend(batch)
+                pending = new_pending
+                continue
+
+            fleet_left[chosen_truck] -= 1
+            bearings = [ln["bearing"] for ln in batch]
+            centroid = _circular_mean(bearings)
+            spread = max((_circular_angle_diff(b, centroid) for b in bearings), default=0)
+            loads.append({
+                "load_id": f"L{load_id_counter:03d}",
+                "site": site,
+                "group": ("adaptive", centroid, spread),
+                "truck_type": chosen_truck,
+                "lines": batch,
+                "total_m3": batch_m3,
+                "total_kg": batch_kg,
+                "n_customers": len(custset),
+            })
+            load_id_counter += 1
+            pending = new_pending
+
+    return loads, unassigned, fleet_left
+
+
+def assemble_loads(lines):
+    if GROUP_MODE == "adaptive":
+        return _assemble_loads_adaptive(lines)
+    return _assemble_loads_fixed(lines)
 
 
 OVERHANG_ALLOW = 0.15
@@ -373,17 +470,12 @@ def pack_load(load):
             "cube_cap_m3": spec["cube_cap_m3"],
         }}, leftover
 
-    # Two trailers (34T): bias closer-to-site customers into the front trailer
-    # (empties first / drop 1) and farther customers into the rear trailer, but
-    # let a unit fall back to the OTHER trailer if its preferred one is full --
-    # otherwise a lot of freight gets stranded even when the truck as a whole
-    # still has spare capacity, purely because of a rigid 50/50 split.
     front_spec = next(t for t in trailers if t["name"] == "front")
     rear_spec = next(t for t in trailers if t["name"] == "rear")
     front_state = _new_trailer_state(front_spec)
     rear_state = _new_trailer_state(rear_spec)
 
-    units = _expand_units(bundle_recs)  # longest/heaviest first -- stability rule
+    units = _expand_units(bundle_recs)
     dists = sorted(u["dist_km"] for u in units)
     median_dist = dists[len(dists) // 2] if dists else 0
 
@@ -399,9 +491,6 @@ def pack_load(load):
             continue
         leftover.append(u)
 
-    # Cube capacity isn't split by trailer in the source data (only a single
-    # truck-level total), so approximate each trailer's share proportional to
-    # its length -- both trailers share the same width/height on a 34T truck.
     front_cube_cap = spec["cube_cap_m3"] * front_spec["length_m"] / total_trailer_length
     rear_cube_cap = spec["cube_cap_m3"] * rear_spec["length_m"] / total_trailer_length
 
@@ -423,7 +512,8 @@ if __name__ == "__main__":
     print(f"Enriched lines (joined ok): {len(lines)}")
 
     loads, unassigned, fleet_left = assemble_loads(lines)
-    print(f"\nLoads built: {len(loads)}")
+    print(f"\nMode: {GROUP_MODE}")
+    print(f"Loads built: {len(loads)}")
     print(f"Unassigned lines: {len(unassigned)}")
     print(f"Fleet remaining: {fleet_left}")
 
