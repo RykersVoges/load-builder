@@ -14,7 +14,7 @@ import openpyxl
 import load_builder as lb
 from build_outputs import write_loads_summary, write_orders_summary, write_schematics_pdf
 
-APP_VERSION = "v16 (17 Jul 2026)"
+APP_VERSION = "v17 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
@@ -84,6 +84,7 @@ if uploaded is not None:
         rows = []
         for load in loads:
             spec = lb.TRUCK_TYPES[load["truck_type"]]
+            total_bundles = sum(ln["bundles"] for ln in load["lines"])
             rows.append({
                 "Load ID": load["load_id"], "Site": load["site"], "Truck": load["truck_type"],
                 "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
@@ -91,6 +92,7 @@ if uploaded is not None:
                 "KG": round(load["total_kg"]),
                 "Weight Util %": round(load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100),
                 "Drops": load["n_customers"], "Lines": len(load["lines"]),
+                "Bundles placed": total_bundles - len(load["pack_leftover"]),
                 "Not physically placed": len(load["pack_leftover"]),
             })
         st.dataframe(rows, use_container_width=True)
