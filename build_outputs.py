@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v39 (18 Jul 2026)"
+APP_VERSION = "v40 (18 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -390,7 +390,7 @@ def _badge(ax, x, y, w, h, pct, label):
 TEXT_HALO = dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.88)
 
 
-def draw_trailer(ax, trailer_info, title, style_map, seq_map):
+def draw_trailer(ax, trailer_info, title, style_map, seq_map, show_uids=False):
     spec = trailer_info["spec"]
     length_cap, height_cap = spec["length_m"], spec["height_m"]
     # Draw exactly as many lanes as this trailer actually has (2 for a
@@ -459,15 +459,16 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
         so_short = p["sales_order"].replace("SFP-", "").replace("-SO", "")
         h = p["bundle_height_m"]
         w = p["bundle_length_m"]
+        bid_tag = (" b%d" % p["bid"]) if (show_uids and p.get("bid")) else ""
         if w < 1.05 or h < 0.16:
-            label = "#%d" % seq_no
+            label = "#%d%s" % (seq_no, bid_tag)
             fontsize = max(5.5, min(8.0, min(w, h) * 22))
             tiny_notes.append((seq_no, so_short, p["sku"], p["delivery_name"]))
         elif h >= 0.32:
-            label = "#%d\nOrd %s\nSKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
+            label = "#%d%s\nOrd %s\nSKU %s\n%s" % (seq_no, bid_tag, so_short, p["sku"], p["delivery_name"][:20])
             fontsize = max(4.0, min(6.0, h * 13))
         else:
-            label = "#%d Ord %s | SKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
+            label = "#%d%s Ord %s | SKU %s\n%s" % (seq_no, bid_tag, so_short, p["sku"], p["delivery_name"][:20])
             fontsize = max(3.8, min(5.6, h * 15))
         clip_box = patches.Rectangle((p["x"], y), p["bundle_length_m"], p["bundle_height_m"], transform=ax.transData)
         ax.text(p["x"] + p["bundle_length_m"] / 2, y + p["bundle_height_m"] / 2, label,
@@ -525,55 +526,72 @@ def _draw_top_legend(fig, load, style_map, seq_map, rect):
                 fontsize=6.6, va="center", color="#333333")
 
 
+# Reference drawing span (metres) that maps to the full page width: a 34T
+# interlink (6m front + 12m rear + margins). Every truck is drawn at THIS
+# same metres-per-page scale and centred -- so an 8T or 14T page no longer
+# stretches its (much shorter) trailer to fill the whole page, which used
+# to make those pages look zoomed-in/cut-off next to the 34T pages.
+REF_TOTAL_SPAN = 6 + 12 + 2 * 0.9
+
+
+def render_load_figure(load, page_no=1, n_total=1, show_uids=False):
+    """Build the one-page schematic figure for a single load. Used for both
+    the PDF export and the on-screen interactive load editor."""
+    fig = plt.figure(figsize=(11.7, 8.3))
+    fig.patch.set_facecolor("white")
+
+    header_ax = fig.add_axes([0, 0.93, 1, 0.07])
+    header_ax.axis("off")
+    header_ax.add_patch(patches.Rectangle((0, 0), 1, 0.05, transform=header_ax.transAxes,
+                                           facecolor=NAVY, edgecolor="none"))
+    header_ax.text(0.01, 0.62, "LOAD %s" % load["load_id"], fontsize=17, fontweight="bold",
+                    color=NAVY, va="center", transform=header_ax.transAxes)
+    n_orders = len({ln["sales_order"] for ln in load["lines"]})
+    n_skus = len({ln["sku"] for ln in load["lines"]})
+    total_bundles = sum(ln["bundles"] for ln in load["lines"])
+    placed_bundles = total_bundles - len(load["pack_leftover"])
+    subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   "
+                "%s orders, %s SKUs, %s drops, %s lines   |   %d/%d bundles placed" % (
+        load["site"], group_label(load["group"]), truck_display_name(load["truck_type"]), load["total_m3"], load["total_kg"],
+        n_orders, n_skus, load["n_customers"], len(load["lines"]), placed_bundles, total_bundles))
+    header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
+                    transform=header_ax.transAxes)
+
+    seq_map = _drop_sequence(load)
+    style_map = _customer_style_map(load)
+    _draw_top_legend(fig, load, style_map, seq_map, [0.01, 0.80, 0.98, 0.12])
+
+    names = list(load["packing"].keys())
+    spans = [load["packing"][name]["spec"]["length_m"] + 0.9 for name in names]
+    total_span = sum(spans)
+    # consistent metres-per-page scale across all truck types, centred
+    plot_area_width = 0.98 * min(1.0, total_span / REF_TOTAL_SPAN)
+    x_cursor = 0.01 + (0.98 - plot_area_width) / 2.0
+    trailer_top = 0.70
+    for i, name in enumerate(names):
+        w = plot_area_width * spans[i] / total_span
+        ax = fig.add_axes([x_cursor, 0.08, w - 0.02, trailer_top])
+        draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map, seq_map,
+                     show_uids=show_uids)
+        x_cursor += w
+
+    footer_ax = fig.add_axes([0, 0, 1, 0.03])
+    footer_ax.axis("off")
+    footer_ax.text(0.99, 0.5, "Page %d of %d" % (page_no, n_total), fontsize=7.5, color="#999999",
+                    ha="right", va="center", transform=footer_ax.transAxes)
+    footer_ax.text(0.5, 0.5, "Build %s" % APP_VERSION, fontsize=7.5, color="#999999",
+                   ha="center", va="center")
+    footer_ax.text(0.01, 0.5, "Generated load-building schematic -- verify against physical stock before dispatch",
+                    fontsize=7, color="#AAAAAA", ha="left", va="center", transform=footer_ax.transAxes)
+
+    return fig
+
+
 def write_schematics_pdf(loads, path):
     n_total = len(loads)
     with PdfPages(path) as pdf:
         for page_no, load in enumerate(loads, start=1):
-            fig = plt.figure(figsize=(11.7, 8.3))
-            fig.patch.set_facecolor("white")
-
-            header_ax = fig.add_axes([0, 0.93, 1, 0.07])
-            header_ax.axis("off")
-            header_ax.add_patch(patches.Rectangle((0, 0), 1, 0.05, transform=header_ax.transAxes,
-                                                   facecolor=NAVY, edgecolor="none"))
-            header_ax.text(0.01, 0.62, "LOAD %s" % load["load_id"], fontsize=17, fontweight="bold",
-                            color=NAVY, va="center", transform=header_ax.transAxes)
-            n_orders = len({ln["sales_order"] for ln in load["lines"]})
-            n_skus = len({ln["sku"] for ln in load["lines"]})
-            total_bundles = sum(ln["bundles"] for ln in load["lines"])
-            placed_bundles = total_bundles - len(load["pack_leftover"])
-            subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   "
-                        "%s orders, %s SKUs, %s drops, %s lines   |   %d/%d bundles placed" % (
-                load["site"], group_label(load["group"]), truck_display_name(load["truck_type"]), load["total_m3"], load["total_kg"],
-                n_orders, n_skus, load["n_customers"], len(load["lines"]), placed_bundles, total_bundles))
-            header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
-                            transform=header_ax.transAxes)
-
-            seq_map = _drop_sequence(load)
-            style_map = _customer_style_map(load)
-            _draw_top_legend(fig, load, style_map, seq_map, [0.01, 0.80, 0.98, 0.12])
-
-            plot_area_width = 0.98
-            names = list(load["packing"].keys())
-            spans = [load["packing"][name]["spec"]["length_m"] + 0.9 for name in names]
-            total_span = sum(spans)
-            x_cursor = 0.01
-            trailer_top = 0.70
-            for i, name in enumerate(names):
-                w = plot_area_width * spans[i] / total_span
-                ax = fig.add_axes([x_cursor, 0.08, w - 0.02, trailer_top])
-                draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map, seq_map)
-                x_cursor += w
-
-            footer_ax = fig.add_axes([0, 0, 1, 0.03])
-            footer_ax.axis("off")
-            footer_ax.text(0.99, 0.5, "Page %d of %d" % (page_no, n_total), fontsize=7.5, color="#999999",
-                            ha="right", va="center", transform=footer_ax.transAxes)
-            footer_ax.text(0.5, 0.5, "Build %s" % APP_VERSION, fontsize=7.5, color="#999999",
-                           ha="center", va="center")
-            footer_ax.text(0.01, 0.5, "Generated load-building schematic -- verify against physical stock before dispatch",
-                            fontsize=7, color="#AAAAAA", ha="left", va="center", transform=footer_ax.transAxes)
-
+            fig = render_load_figure(load, page_no, n_total)
             pdf.savefig(fig, orientation="landscape")
             plt.close(fig)
 
