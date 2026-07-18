@@ -17,15 +17,15 @@ from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
                            default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v38 (17 Jul 2026)"
+APP_VERSION = "v39 (18 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v38":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v38. "
+if lb_ver != "v39":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v39. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v38, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v39, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -131,13 +131,13 @@ with st.sidebar:
     lb.TRUCK_TYPES["8T"]["fleet_count"] = st.number_input("8 Ton Tautliner", min_value=0, value=0)
 
     build_everything = st.checkbox(
-        "Build every load regardless of fleet size (decide what to dispatch afterward)", value=True,
-        help=("Ticked (default): for any truck type above with at least 1 truck entered, the "
-              "builder assumes as many of THAT type as needed are available, so every delivery "
-              "line ends up in some load -- nothing goes unassigned just because the fleet count "
-              "above ran out. Review the utilisation numbers below and decide which loads to "
-              "actually dispatch. Untick to see a realistic plan limited to the exact truck "
-              "counts entered above."))
+        "Build every load regardless of fleet size (decide what to dispatch afterward)", value=False,
+        help=("Unticked (default): a realistic plan limited to the exact truck counts entered "
+              "above -- if a fleet runs out, remaining freight is reported as unassigned instead "
+              "of silently getting a truck that doesn't exist. Tick to assume unlimited trucks of "
+              "any type with at least 1 entered above, so every delivery line ends up in some "
+              "load -- nothing goes unassigned just because the fleet count ran out. Review the "
+              "utilisation numbers below and decide which loads to actually dispatch."))
 
 uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 
@@ -295,27 +295,51 @@ if "result" in st.session_state:
 
     if st.button("Rebuild with these truck types"):
         id_to_truck = dict(st.session_state["truck_overrides"])
-        warnings = []
+        changed_ids = [lid for lid, t in id_to_truck.items() if t != next(
+            (l["truck_type"] for l in loads if l["load_id"] == lid), t)]
+        # Re-plan every CHANGED load against a shared unassigned pool, so a
+        # load resized to a bigger truck can pick up nearby freight that an
+        # earlier override just evicted (or that was already unassigned),
+        # and a load resized to a smaller truck sheds its excess back into
+        # that same pool for a later load to potentially pick up.
+        shared_unassigned = list(res["unassigned"])
+        moved_notes = []
         for load in loads:
             new_truck = id_to_truck.get(load["load_id"], load["truck_type"])
-            load["truck_type"] = new_truck
+            if new_truck == load["truck_type"]:
+                continue
+            before_n, before_m3 = len(load["lines"]), load["total_m3"]
+            lb.resize_load_for_truck(load, new_truck, shared_unassigned)
+            moved_notes.append((load["load_id"], lb.truck_display_name(new_truck),
+                                 before_n, len(load["lines"]), before_m3, load["total_m3"]))
+        res["unassigned"] = shared_unassigned
+
+        warnings = []
+        for load in loads:
             packing, leftover = lb.pack_load(load)
             load["packing"] = packing
             load["pack_leftover"] = leftover
             if leftover:
-                warnings.append((load["load_id"], lb.truck_display_name(new_truck), len(leftover)))
+                warnings.append((load["load_id"], lb.truck_display_name(load["truck_type"]), len(leftover)))
         st.session_state["result"]["loads"] = loads
+        st.session_state["result"]["unassigned"] = shared_unassigned
         # NOTE: st.rerun() below immediately aborts this script run, so any
         # st.success/st.warning called here would never actually reach the
         # browser -- stash the message and show it after the rerun instead.
+        msg_lines = []
+        if moved_notes:
+            details = "; ".join(
+                f"{lid} -> {t}: {n0} to {n1} lines ({m0:.1f} to {m1:.1f} m3)"
+                for lid, t, n0, n1, m0, m1 in moved_notes)
+            msg_lines.append(f"Re-planned: {details}.")
         if warnings:
             details = "; ".join(f"{lid} on {t}: {n} bundle(s) would not fit" for lid, t, n in warnings)
-            st.session_state["rebuild_message"] = ("warning",
-                f"Rebuilt -- but some bundles no longer physically fit: {details}. "
-                "Consider a bigger truck for those loads, or move some freight to another load.")
+            msg_lines.append(f"Some bundles no longer physically fit: {details}. "
+                              "Consider a bigger truck for those loads, or move some freight to another load.")
+            st.session_state["rebuild_message"] = ("warning", " ".join(msg_lines))
         else:
-            st.session_state["rebuild_message"] = ("success",
-                "Rebuilt -- every bundle still physically fits with your chosen truck types.")
+            msg_lines.append("Every bundle still physically fits with your chosen truck types.")
+            st.session_state["rebuild_message"] = ("success", " ".join(msg_lines))
         st.rerun()
 
     wb = openpyxl.Workbook()
