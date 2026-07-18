@@ -13,7 +13,7 @@ gap-filled skyline packing from the previous round is unchanged.
 from collections import defaultdict
 import openpyxl
 
-APP_VERSION = "v37 (17 Jul 2026)"
+APP_VERSION = "v38 (17 Jul 2026)"
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.utils import get_column_letter
@@ -25,7 +25,8 @@ import matplotlib.patches as patches
 from matplotlib.backends.backend_pdf import PdfPages
 
 from load_builder import (
-    load_workbook_data, enrich_lines, assemble_loads, pack_load, TRUCK_TYPES, group_label
+    load_workbook_data, enrich_lines, assemble_loads, pack_load, TRUCK_TYPES, group_label,
+    truck_display_name
 )
 
 NAVY = "#1F3352"
@@ -122,7 +123,7 @@ def write_loads_summary(wb, loads, unassigned):
         full_partial = "Full" if all(f == "Full" for f in full_flags) else "Partial"
         leftover_n = len(load.get("pack_leftover", []))
         total_bundles = sum(ln["bundles"] for ln in load["lines"])
-        row = [load["load_id"], load["site"], load["truck_type"], group_label(load["group"]),
+        row = [load["load_id"], load["site"], truck_display_name(load["truck_type"]), group_label(load["group"]),
                round(load["total_m3"], 2), round(vol_util, 0), round(load["total_kg"], 0), round(wt_util, 0),
                len(so_set), full_partial, len(sku_set), len(cust_set),
                total_bundles - leftover_n, leftover_n]
@@ -443,6 +444,12 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
             ax.text(-0.62, y0 + height_cap / 2, lane_label, rotation=90, va="center", ha="center",
                     fontsize=8, color=STEEL, fontweight="bold")
 
+    # Bundles too small for even the "#N" one-line label to sit comfortably
+    # get collected here -- their full order/SKU/customer details are never
+    # simply dropped, just moved to a compact callout list below the axis.
+    # This should be rare (only the very shortest bundles).
+    tiny_notes = []
+
     for p in trailer_info["placements"]:
         y_offset = lane_pitch * p["slot"]
         y = y_offset + p["y"]
@@ -455,6 +462,7 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
         if w < 1.05 or h < 0.16:
             label = "#%d" % seq_no
             fontsize = max(5.5, min(8.0, min(w, h) * 22))
+            tiny_notes.append((seq_no, so_short, p["sku"], p["delivery_name"]))
         elif h >= 0.32:
             label = "#%d\nOrd %s\nSKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
             fontsize = max(4.0, min(6.0, h * 13))
@@ -476,6 +484,23 @@ def draw_trailer(ax, trailer_info, title, style_map, seq_map):
         ax.plot([tick, tick], [-0.26, -0.20], color="#888888", linewidth=1.0, zorder=1)
         ax.text(tick, -0.48, "%g" % tick, fontsize=6.5, ha="center", color="#555555")
         tick += tick_step
+
+    if tiny_notes:
+        seen, unique_notes = set(), []
+        for note in tiny_notes:
+            key = (note[0], note[2])  # (seq_no, sku) -- same customer can have >1 tiny SKU
+            if key not in seen:
+                seen.add(key)
+                unique_notes.append(note)
+        ylo, yhi = ax.get_ylim()
+        extra_h = 0.20 + 0.20 * len(unique_notes)
+        ax.set_ylim(ylo - extra_h, yhi)
+        ax.text(length_cap / 2, -0.62, "Too small to label in place:",
+                fontsize=6.2, ha="center", color="#777777", style="italic")
+        for i, (seq_no, so_short, sku, name) in enumerate(unique_notes):
+            ax.text(length_cap / 2, -0.62 - 0.20 * (i + 1),
+                    "#%d  Ord %s | SKU %s | %s" % (seq_no, so_short, sku, name),
+                    fontsize=6.2, ha="center", color="#333333")
 
 
 def _draw_top_legend(fig, load, style_map, seq_map, rect):
@@ -519,7 +544,7 @@ def write_schematics_pdf(loads, path):
             placed_bundles = total_bundles - len(load["pack_leftover"])
             subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   "
                         "%s orders, %s SKUs, %s drops, %s lines   |   %d/%d bundles placed" % (
-                load["site"], group_label(load["group"]), load["truck_type"], load["total_m3"], load["total_kg"],
+                load["site"], group_label(load["group"]), truck_display_name(load["truck_type"]), load["total_m3"], load["total_kg"],
                 n_orders, n_skus, load["n_customers"], len(load["lines"]), placed_bundles, total_bundles))
             header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
                             transform=header_ax.transAxes)
