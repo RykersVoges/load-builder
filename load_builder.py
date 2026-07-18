@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v38"
+LB_VERSION = "v39"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -850,6 +850,79 @@ def _try_salvage_into_existing(evicted_lines, kept_loads):
         if not placed:
             still_evicted.append(ln)
     return still_evicted
+
+
+def resize_load_for_truck(load, new_truck_key, unassigned_pool):
+    """Re-plan a single already-built load for a NEW truck type -- used by
+    the 'truck type override' Rebuild action, so switching a load to a
+    bigger/smaller truck actually changes what's ON it, not just whether the
+    same freight still physically fits.
+
+    Step 1 (shrink): if the load's current freight no longer fits the new
+    truck's weight/cube caps, evict the least-urgent lines (latest due date
+    first) back into `unassigned_pool` until it fits.
+    Step 2 (grow): if the new truck has spare capacity, pull in nearby
+    freight sitting in `unassigned_pool` -- same site, same corridor/
+    direction/province this load was originally built under (via
+    `_line_fits_load_group`) -- oldest-due first, same as a fresh build
+    would for this truck size.
+
+    Mutates `load` (truck_type, lines, total_m3, total_kg, n_customers) and
+    `unassigned_pool` (evicted lines appended, consumed lines removed) in
+    place. Caller should re-run pack_load() afterwards to get the real
+    placement/leftover for the new truck.
+    """
+    max_drops = MAX_DROPS_PER_LOAD
+    spec = TRUCK_TYPES[new_truck_key]
+    cap_kg = spec["payload_cap_t"] * 1000
+    cap_m3 = spec["cube_cap_m3"]
+
+    load["truck_type"] = new_truck_key
+
+    lines = sorted(load["lines"], key=lambda x: (x["due"] is None, x["due"]))
+    kept, evicted = [], []
+    kg = m3 = 0.0
+    custset = set()
+    for ln in lines:
+        new_custset = custset | {ln["location_code"]}
+        add_kg = ln["bundle_kg"] * ln["bundles"]
+        add_m3 = ln["m3"]
+        would_exceed = (kg + add_kg > cap_kg + 1e-6 or m3 + add_m3 > cap_m3 + 1e-6
+                        or len(new_custset) > max_drops)
+        if would_exceed:
+            evicted.append(ln)
+            continue
+        kept.append(ln)
+        kg += add_kg
+        m3 += add_m3
+        custset = new_custset
+    if evicted:
+        unassigned_pool.extend(evicted)
+
+    # Spare capacity on the new truck -- top it up from nearby unassigned
+    # freight, same as a fresh build would.
+    candidates = [ln for ln in unassigned_pool if _line_fits_load_group(ln, load)]
+    candidates.sort(key=lambda x: (x["due"] is None, x["due"]))
+    consumed = []
+    for ln in candidates:
+        new_custset = custset | {ln["location_code"]}
+        add_kg = ln["bundle_kg"] * ln["bundles"]
+        add_m3 = ln["m3"]
+        if kg + add_kg > cap_kg + 1e-6 or m3 + add_m3 > cap_m3 + 1e-6 or len(new_custset) > max_drops:
+            continue
+        kept.append(ln)
+        kg += add_kg
+        m3 += add_m3
+        custset = new_custset
+        consumed.append(ln)
+    for ln in consumed:
+        unassigned_pool.remove(ln)
+
+    load["lines"] = kept
+    load["total_kg"] = kg
+    load["total_m3"] = m3
+    load["n_customers"] = len(custset)
+    return load
 
 
 def assemble_loads(lines):
