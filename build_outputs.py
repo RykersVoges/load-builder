@@ -1,346 +1,594 @@
 """
-Load-Building web app.
-Upload the input Excel, adjust the parameters in the sidebar, click Build Loads,
-then download the two output files. Deploy this on Streamlit Community Cloud
-(free) to get a shareable URL your team can use -- see the deployment guide
-for step-by-step instructions.
+Generates the two output Excel tabs (Loads Summary, Orders Line Summary)
+and one landscape schematic page per load (multi-page PDF), from the
+load_builder prototype's results.
+
+Schematic v5: numeric length-axis tick labels along the bottom of each
+trailer, explicit "Ord"/"SKU" tags so the two numbers on a bundle are never
+ambiguous, a white halo behind every label so hatch lines never run through
+the text, and lighter (single-pass) hatch patterns for less ink and a
+cleaner look. Legend stays at the top in route order (closest drop first);
+gap-filled skyline packing from the previous round is unchanged.
 """
-import io
-import tempfile
-
-import streamlit as st
+from collections import defaultdict
 import openpyxl
-import pandas as pd
 
-import load_builder as lb
-from build_outputs import (write_loads_summary, write_orders_summary,
-                           write_schematics_pdf, write_transport_orders,
-                           default_schedule_cfg, DAY_ABBR)
+APP_VERSION = "v39 (18 Jul 2026)"
+from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.worksheet.page import PageMargins
+from openpyxl.utils import get_column_letter
 
-APP_VERSION = "v38 (17 Jul 2026)"
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.backends.backend_pdf import PdfPages
 
-st.set_page_config(page_title="Load Builder", layout="wide")
-st.title("Load Builder")
-lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v38":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v38. "
-             "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v38, otherwise a file on GitHub is outdated.")
+from load_builder import (
+    load_workbook_data, enrich_lines, assemble_loads, pack_load, TRUCK_TYPES, group_label,
+    truck_display_name
+)
 
-with st.sidebar:
-    st.header("Parameters")
-    group_mode = st.radio(
-        "Group customers by",
-        ["Adaptive (recommended)", "Direction (fixed degrees)", "Province"],
-        index=0,
-        help=("Adaptive seeds each load with the oldest-due order, then pulls in the nearest "
-              "other pending orders by direction (not a fixed degree boundary) until the truck "
-              "is as full as possible -- generally fills trucks fuller than a fixed bucket. "
-              "Direction/Province match the original fixed-bucket instructions exactly."),
-    )
-    lb.GROUP_MODE = {"Adaptive (recommended)": "adaptive", "Direction (fixed degrees)": "direction",
-                      "Province": "province"}[group_mode]
-    lb.DIRECTION_DEGREES = st.number_input(
-        "Direction bucket size (degrees)", min_value=5, max_value=180, value=30, step=5,
-        disabled=(lb.GROUP_MODE != "direction"))
-    lb.MAX_CORRIDOR_SPREAD_DEG = st.number_input(
-        "Max corridor spread (degrees)", min_value=10, max_value=180, value=60, step=5,
-        disabled=(lb.GROUP_MODE != "adaptive"),
-        help=("Adaptive mode will never combine freight whose bearing from the site differs "
-              "from the load's seed order by more than this, no matter how empty the truck "
-              "still is. Prevents e.g. Limpopo and Cape Town freight ending up on the same "
-              "load just because they happen to share a similar-looking bearing from the site "
-              "-- a load ships under-full instead of reaching that far. Lower = tighter, more "
-              "geographically sensible loads but more (smaller) loads overall."))
-    lb.MAX_DROPS_PER_LOAD = st.number_input(
-        "Max customer drops per load", min_value=1, max_value=20, value=10,
-        help=("Raising this lets adaptive mode pull more nearby orders into the same truck "
-              "before calling it full -- directly raises volume utilisation. Tested against "
-              "your real data: 5 drops = 9 loads (highest 64.2 m3), 10 drops = 7 loads "
-              "(highest 64.2 m3, 2 loads over 50 m3), 12 drops = 6 loads (3 loads over 50 m3, "
-              "one at 51.4 m3). Fewer, fuller trucks."))
+NAVY = "#1F3352"
+STEEL = "#4A6B8A"
+INK = "#1A1A1A"
 
-    lb.OVERHANG_ALLOW = st.number_input(
-        "Max overhang %", min_value=0, max_value=50, value=15, step=5,
-        help=("How far a bundle may stick out past the stack supporting it, as a % of the "
-              "supporting surface's length. 0 = every bundle fully supported. Around 15% is "
-              "realistic; too much risks bundles bending or tipping.")) / 100.0
-    lb.MIN_WT_UTIL_PCT = st.number_input(
-        "Min weight utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
-        help=("Only affects WHICH TRUCK SIZE gets picked when more than one type still has "
-              "fleet available -- it prefers a truck this batch fills well. It does NOT strand "
-              "freight: as long as some enabled truck type still has fleet left and the batch "
-              "physically fits, that truck is used regardless of this %. Freight only goes "
-              "unassigned when every enabled truck type has run out, or the batch is too big "
-              "for even the largest one."))
-    lb.MIN_VOL_UTIL_PCT = st.number_input(
-        "Min volume utilisation % to dispatch", min_value=0, max_value=100, value=75, step=5,
-        help="Alternative dispatch threshold: % of the truck's cube capacity (same caveat as above).")
+# Distinct customer styles used as thin borders/text accents + a light hatch
+# pattern (never a solid fill) so the whole schematic is cheap to print in
+# black ink. Single-character hatch codes = sparser lines than repeated ones.
+ACCENTS = ["#4C78A8", "#F58518", "#54A24B", "#B2323C", "#4FA9A5",
+           "#B8860B", "#7B4F9D", "#C2568B", "#8C5A2B", "#5C5C5C"]
+HATCHES = ["/", "\\", "|", "-", "+", "x", ".", "o", "*", "\\|"]
 
-    st.subheader("Demand Buckets")
-    use_demand_buckets = st.checkbox(
-        "Include Demand Buckets / Transport Orders tab", value=True,
-        help=("Ticked (default): builds a 'Transport Orders' tab in the Excel output, matching "
-              "every SKU line back to its Demand Bucket ID from the uploaded Demand Buckets tab, "
-              "on the loading/delivery schedule set below. Untick if you only want the Loads "
-              "Summary and Orders Line Summary tabs -- no Transport Orders tab will be built at all."))
 
-    to_start = st.number_input(
-        "First Transport Order number", min_value=1, value=1870584, step=1,
-        disabled=not use_demand_buckets,
-        help=("The Transport Orders tab numbers TOs sequentially starting here. Set it to "
-              "follow on from the last TO number already in your TMS."))
+def _drop_sequence(load):
+    """Order drops by distance from site (closest first == drop 1 / front
+    trailer, matching the loading/unloading sequence), returns
+    {location_code: (seq_no, name, min_dist_km)}."""
+    best = {}
+    for t in load["packing"].values():
+        for p in t["placements"]:
+            code = p.get("location_code")
+            d = p.get("dist_km", 0)
+            if code not in best or d < best[code][1]:
+                best[code] = (p.get("delivery_name", ""), d)
+    ordered = sorted(best.items(), key=lambda kv: kv[1][1])
+    return {code: (i + 1, name, dist) for i, (code, (name, dist)) in enumerate(ordered)}
 
-    sched = default_schedule_cfg()
-    with st.expander("Loading & delivery schedule", expanded=False):
-        sched["offset_days"] = st.number_input(
-            "Load in how many days from today", min_value=0, max_value=14, value=2,
-            help="Load building today, trucks loaded this many days later.")
-        sched["duration_h"] = st.number_input(
-            "Load duration (hours)", min_value=0.5, max_value=12.0, value=2.0, step=0.5)
-        sched["spacing_h"] = st.number_input(
-            "Time between load starts (hours)", min_value=0.5, max_value=24.0, value=2.0, step=0.5,
-            help="Start of one load to the start of the next at the same site.")
-        sched["deliver_start"] = st.text_input("Delivery window opens (HH:MM)", "08:00")
-        sched["deliver_end"] = st.text_input("Delivery window closes (HH:MM)", "17:00")
 
-    for label, code in (("Weza (WSM) loading shifts", "WSM"), ("Langeni (LSM) loading shifts", "LSM")):
-        with st.expander(label):
-            s = sched["shifts"][code]
-            st.caption("Format HH:MM-HH:MM. Leave a shift BLANK if the site doesn't load then. "
-                       "A night shift ending earlier than it starts runs past midnight.")
-            s["weekday_day"] = st.text_input("Mon-Fri day shift", s["weekday_day"], key=code + "wd")
-            s["weekday_night"] = st.text_input("Mon-Fri night shift", s["weekday_night"], key=code + "wn")
-            s["sat_day"] = st.text_input("Saturday day shift", s["sat_day"], key=code + "sd")
-            s["sat_night"] = st.text_input("Saturday night shift", s["sat_night"], key=code + "sn")
-            s["sun_day"] = st.text_input("Sunday day shift", s["sun_day"], key=code + "ud")
-            s["sun_night"] = st.text_input("Sunday night shift", s["sun_night"], key=code + "un")
-            s["skip_night_days"] = st.multiselect(
-                "Days with NO night shift", DAY_ABBR, default=s["skip_night_days"], key=code + "sk")
+def _customer_style_map(load):
+    seq = _drop_sequence(load)
+    codes = sorted(seq.keys(), key=lambda c: seq[c][0])
+    return {code: (ACCENTS[i % len(ACCENTS)], HATCHES[i % len(HATCHES)]) for i, code in enumerate(codes)}
 
-    st.subheader("Fleet available (number of trucks)")
-    lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=20)
-    lb.TRUCK_TYPES["FD"]["fleet_count"] = st.number_input(
-        "34 Ton Flat Deck", min_value=0, value=0,
-        help=("Dimensions/capacity come from the matching column in the uploaded Truck "
-              "Dimensions tab if present (matched on the word 'flat' in the header, whatever "
-              "the exact tonnage/name), otherwise a placeholder spec is used. Set to 0 if you "
-              "don't have any."))
-    lb.TRUCK_TYPES["30T"]["fleet_count"] = st.number_input("30 Ton Tri Axle Tautliner", min_value=0, value=0)
-    lb.TRUCK_TYPES["14T"]["fleet_count"] = st.number_input("14 Ton Tautliner", min_value=0, value=0)
-    lb.TRUCK_TYPES["8T"]["fleet_count"] = st.number_input("8 Ton Tautliner", min_value=0, value=0)
+THIN = Side(style="thin", color="000000")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+BOLD = Font(bold=True)
 
-    build_everything = st.checkbox(
-        "Build every load regardless of fleet size (decide what to dispatch afterward)", value=True,
-        help=("Ticked (default): for any truck type above with at least 1 truck entered, the "
-              "builder assumes as many of THAT type as needed are available, so every delivery "
-              "line ends up in some load -- nothing goes unassigned just because the fleet count "
-              "above ran out. Review the utilisation numbers below and decide which loads to "
-              "actually dispatch. Untick to see a realistic plan limited to the exact truck "
-              "counts entered above."))
 
-uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
-
-# Cache the uploaded bytes into session_state as soon as a file lands, and
-# use THAT (not the live `uploaded` widget value) for everything below.
-# file_uploader's return value can go back to None on a rerun it wasn't
-# itself the trigger for (this has been observed after other widgets --
-# e.g. a download button -- cause a rerun); if the rest of the app depended
-# on `uploaded` directly, that alone would make the whole page collapse
-# back to "upload to get started" even though a file was clearly already
-# provided. Caching decouples the two.
-if uploaded is not None:
-    st.session_state["uploaded_bytes"] = uploaded.getvalue()
-    st.session_state["uploaded_name"] = uploaded.name
-have_file = "uploaded_bytes" in st.session_state
-
-# Build results live in session_state, NOT inside the button's if-block --
-# in Streamlit, EVERY widget interaction (including clicking a button
-# further down the page) reruns the whole script, and a plain
-# "if st.button(...)" only reads True on the exact run it was clicked. If
-# the results were nested inside that block, clicking anything below them
-# (like a truck-type override) would make the button re-evaluate to False
-# and the entire page would appear to reset. Storing the result means it
-# keeps rendering on every later rerun until a new "Build Loads" click
-# replaces it.
-if have_file and st.button("Build Loads", type="primary"):
-    with st.spinner("Building loads..."):
-        try:
-            sites, customers, skus, orders, excluded = lb.load_workbook_data(
-                io.BytesIO(st.session_state["uploaded_bytes"]))
-        except ValueError as e:
-            st.error(f"Problem with the uploaded workbook: {e}")
-            st.stop()
-        lines = lb.enrich_lines(orders, customers, skus, sites)
-
-        saved_fleet = {k: lb.TRUCK_TYPES[k]["fleet_count"] for k in lb.TRUCK_TYPES}
-        if build_everything:
-            for k in lb.TRUCK_TYPES:
-                if saved_fleet[k] > 0:
-                    lb.TRUCK_TYPES[k]["fleet_count"] = 9999
-        try:
-            loads, unassigned, fleet_left = lb.assemble_loads(lines)
-        finally:
-            for k in lb.TRUCK_TYPES:
-                lb.TRUCK_TYPES[k]["fleet_count"] = saved_fleet[k]
-
-        for load in loads:
-            packing, leftover = lb.pack_load(load)
-            load["packing"] = packing
-            load["pack_leftover"] = leftover
-
-    st.session_state["result"] = {
-        "loads": loads, "unassigned": unassigned, "fleet_left": fleet_left,
-        "lines": lines, "sites": sites, "excluded": excluded,
-        "build_everything": build_everything,
-    }
-    st.session_state["truck_overrides"] = {}  # fresh load IDs -- clear any stale overrides
-
-if "result" in st.session_state:
-    res = st.session_state["result"]
-    loads = res["loads"]
-    unassigned = res["unassigned"]
-    fleet_left = res["fleet_left"]
-    lines = res["lines"]
-    sites = res["sites"]
-    excluded = res["excluded"]
-    build_everything_used = res["build_everything"]
-
-    if "rebuild_message" in st.session_state:
-        kind, msg = st.session_state.pop("rebuild_message")
-        getattr(st, kind)(msg)
-
-    st.success(f"Built {len(loads)} loads from {len(lines)} delivery lines "
-               f"({excluded} collects excluded). {len(unassigned)} lines could not be placed.")
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Loads built", len(loads))
-    col2.metric("Unassigned lines", len(unassigned),
-                 help="Delivery lines that couldn't be grouped into any viable load at all -- "
-                      "either no enabled truck type could physically fit this freight, or (if "
-                      "'Build every load regardless of fleet size' is unticked) the fleet you "
-                      "entered above ran out.")
-    col3.metric("Fleet remaining",
-                 "Ignored (unlimited)" if build_everything_used else sum(fleet_left.values()))
-
-    st.subheader("Loads")
-    st.caption(
-        "**Group** = the direction/area this load's customers were clustered by (a compass range for "
-        "Direction/Adaptive modes, or the province code). **Not physically placed** = bundles that were "
-        "assigned to this load on paper but didn't fit once real stacking, weight, and floor-length "
-        "constraints were simulated -- 0 is the goal; anything else needs attention before dispatch."
-    )
-    rows = []
+def build_all():
+    sites, customers, skus, orders, excluded = load_workbook_data()
+    lines = enrich_lines(orders, customers, skus, sites)
+    loads, unassigned, fleet_left = assemble_loads(lines)
     for load in loads:
-        spec = lb.TRUCK_TYPES[load["truck_type"]]
+        packing, leftover = pack_load(load)
+        load["packing"] = packing
+        load["pack_leftover"] = leftover
+    return loads, unassigned, fleet_left, lines, sites
+
+
+def sheet_style_print(ws, n_cols):
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5)
+    ws.print_options.horizontalCentered = True
+    for i in range(1, n_cols + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 16
+
+
+def write_loads_summary(wb, loads, unassigned):
+    ws = wb.active
+    ws.title = "Loads Summary"
+    headers = ["Load ID", "Site", "Truck Type", "Direction/Area Group",
+               "Total m3", "Vol Util %", "Total KG", "Weight Util %",
+               "# Orders", "Full/Partial", "# Unique SKUs", "# Customers/Drops",
+               "# Bundles Placed", "Bundles Not Placed (packing)"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = BOLD
+        c.border = BORDER
+        c.alignment = Alignment(horizontal="center")
+
+    order_loads = defaultdict(set)
+    for load in loads:
+        for ln in load["lines"]:
+            order_loads[ln["sales_order"]].add(load["load_id"])
+    order_unassigned = defaultdict(bool)
+    for ln in unassigned:
+        order_unassigned[ln["sales_order"]] = True
+
+    for load in loads:
+        spec = TRUCK_TYPES[load["truck_type"]]
+        vol_util = load["total_m3"] / spec["cube_cap_m3"] * 100
+        wt_util = load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100
+        so_set = {ln["sales_order"] for ln in load["lines"]}
+        sku_set = {ln["sku"] for ln in load["lines"]}
+        cust_set = {ln["location_code"] for ln in load["lines"]}
+        full_flags = []
+        for so in so_set:
+            is_full = len(order_loads[so]) == 1 and not order_unassigned[so]
+            full_flags.append("Full" if is_full else "Partial")
+        full_partial = "Full" if all(f == "Full" for f in full_flags) else "Partial"
+        leftover_n = len(load.get("pack_leftover", []))
         total_bundles = sum(ln["bundles"] for ln in load["lines"])
-        rows.append({
-            "Load ID": load["load_id"], "Site": load["site"],
-            "Truck": lb.truck_display_name(load["truck_type"]),
-            "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
-            "Vol Util %": round(load["total_m3"] / spec["cube_cap_m3"] * 100),
-            "KG": round(load["total_kg"]),
-            "Weight Util %": round(load["total_kg"] / (spec["payload_cap_t"] * 1000) * 100),
-            "Drops": load["n_customers"], "Lines": len(load["lines"]),
-            "Bundles placed": total_bundles - len(load["pack_leftover"]),
-            "Not physically placed": len(load["pack_leftover"]),
-        })
-    st.dataframe(rows, width="stretch")
+        row = [load["load_id"], load["site"], truck_display_name(load["truck_type"]), group_label(load["group"]),
+               round(load["total_m3"], 2), round(vol_util, 0), round(load["total_kg"], 0), round(wt_util, 0),
+               len(so_set), full_partial, len(sku_set), len(cust_set),
+               total_bundles - leftover_n, leftover_n]
+        ws.append(row)
+        for c in ws[ws.max_row]:
+            c.border = BORDER
+            c.alignment = Alignment(horizontal="center")
 
-    st.subheader("Adjust truck type per load (optional)")
-    st.caption(
-        "Set a different truck type for as many loads as you like below, then click 'Rebuild with "
-        "these truck types' once -- it re-simulates packing for every changed load and updates the "
-        "table above and both downloads below in one go. Nothing changes until you click Rebuild. "
-        "Every truck type is selectable here regardless of the fleet count set in the sidebar -- "
-        "that count only controls how many of each type the automatic build assumes are available."
-    )
-    # Show/store DISPLAY NAMES in the editor (e.g. "34 Ton Flat Deck") but
-    # translate back to the internal key ("FD") when applying the rebuild.
-    key_to_display = {k: lb.truck_display_name(k) for k in lb.TRUCK_TYPES}
-    display_to_key = {v: k for k, v in key_to_display.items()}
-    truck_options = list(key_to_display.values())
+    sheet_style_print(ws, len(headers))
+    ws.freeze_panes = "A2"
+    return ws
 
-    # IMPORTANT: st.data_editor's own "edited_rows" tracking is a ONE-SHOT
-    # delta -- it reflects an edit only on the exact rerun where that edit
-    # happened, and is silently cleared on any LATER rerun (even one with no
-    # new interaction at all, e.g. clicking the Rebuild button below). If we
-    # rebuilt the editor's input fresh from `loads` every run and only read
-    # its return value when Rebuild was clicked, any selection made here
-    # would appear to work, then do nothing once Rebuild was actually
-    # pressed -- exactly what was reported. So we persist the user's choices
-    # into our OWN session_state immediately, and feed that back in as the
-    # editor's baseline on every run, instead of trusting the widget to
-    # remember it for us.
-    if "truck_overrides" not in st.session_state:
-        st.session_state["truck_overrides"] = {}
-    overrides = st.session_state["truck_overrides"]
 
-    override_df = pd.DataFrame([
-        {"Load ID": l["load_id"], "Site": l["site"],
-         "Truck type": key_to_display[overrides.get(l["load_id"], l["truck_type"])]}
-        for l in loads
-    ])
-    edited_df = st.data_editor(
-        override_df,
-        column_config={
-            "Load ID": st.column_config.TextColumn("Load ID", disabled=True),
-            "Site": st.column_config.TextColumn("Site", disabled=True),
-            "Truck type": st.column_config.SelectboxColumn("Truck type", options=truck_options, required=True),
+def write_orders_summary(wb, loads, unassigned):
+    ws = wb.create_sheet("Orders Line Summary")
+    headers = ["Sales Order", "Due Date", "Customer", "Location Code", "SKU",
+               "Bundles", "Bundles Placed", "m3", "KG", "Assigned Load ID", "Site", "Status"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = BOLD
+        c.border = BORDER
+        c.alignment = Alignment(horizontal="center")
+
+    # How many bundles of each line did NOT physically fit in the packing
+    # simulation -- so the Status column tells the truth per line, matching
+    # the schematic's "x/y bundles placed" header exactly.
+    not_placed = defaultdict(int)
+    for load in loads:
+        for u in load.get("pack_leftover", []):
+            not_placed[(load["load_id"], u["sales_order"], u["sku"], u["location_code"])] += 1
+
+    def add_row(ln, load_id, status, placed=None):
+        kg = ln["bundle_kg"] * ln["bundles"]
+        ws.append([ln["sales_order"], ln["due"].strftime("%Y-%m-%d") if ln["due"] else "",
+                   ln["delivery_name"], ln["location_code"], ln["sku"], ln["bundles"],
+                   placed if placed is not None else 0,
+                   round(ln["m3"], 2), round(kg, 1), load_id, ln["site"], status])
+        for c in ws[ws.max_row]:
+            c.border = BORDER
+
+    for load in loads:
+        for ln in load["lines"]:
+            miss = not_placed.get((load["load_id"], ln["sales_order"], ln["sku"], ln["location_code"]), 0)
+            placed = ln["bundles"] - miss
+            if miss == 0:
+                add_row(ln, load["load_id"], "Loaded", placed)
+            else:
+                add_row(ln, load["load_id"],
+                        "PARTIAL -- %d of %d bundles did not fit (floor/stack limits); "
+                        "re-plan or move to another load" % (miss, ln["bundles"]), placed)
+    for ln in unassigned:
+        add_row(ln, "-", "UNASSIGNED (no truck met minimum / fleet exhausted)", 0)
+
+    sheet_style_print(ws, len(headers))
+    ws.freeze_panes = "A2"
+    return ws
+
+
+DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def default_schedule_cfg():
+    return {
+        "offset_days": 2,      # load building today -> loading in N days
+        "duration_h": 2.0,     # how long loading one truck takes
+        "spacing_h": 2.0,      # start of one load to start of the next
+        "deliver_start": "08:00", "deliver_end": "17:00",
+        "shifts": {
+            "WSM": {"weekday_day": "06:30-16:15", "weekday_night": "18:30-04:15",
+                    "sat_day": "", "sat_night": "", "sun_day": "", "sun_night": "",
+                    "skip_night_days": ["Thu"]},
+            "LSM": {"weekday_day": "00:00-24:00", "weekday_night": "",
+                    "sat_day": "00:00-24:00", "sat_night": "",
+                    "sun_day": "00:00-24:00", "sun_night": "",
+                    "skip_night_days": []},
         },
-        hide_index=True, width="stretch", key="truck_override_editor",
-    )
-    for _, r in edited_df.iterrows():
-        overrides[r["Load ID"]] = display_to_key.get(r["Truck type"], r["Truck type"])
+    }
 
-    if st.button("Rebuild with these truck types"):
-        id_to_truck = dict(st.session_state["truck_overrides"])
-        warnings = []
-        for load in loads:
-            new_truck = id_to_truck.get(load["load_id"], load["truck_type"])
-            load["truck_type"] = new_truck
-            packing, leftover = lb.pack_load(load)
-            load["packing"] = packing
-            load["pack_leftover"] = leftover
-            if leftover:
-                warnings.append((load["load_id"], lb.truck_display_name(new_truck), len(leftover)))
-        st.session_state["result"]["loads"] = loads
-        # NOTE: st.rerun() below immediately aborts this script run, so any
-        # st.success/st.warning called here would never actually reach the
-        # browser -- stash the message and show it after the rerun instead.
-        if warnings:
-            details = "; ".join(f"{lid} on {t}: {n} bundle(s) would not fit" for lid, t, n in warnings)
-            st.session_state["rebuild_message"] = ("warning",
-                f"Rebuilt -- but some bundles no longer physically fit: {details}. "
-                "Consider a bigger truck for those loads, or move some freight to another load.")
+
+def _parse_hhmm(s):
+    from datetime import time
+    s = str(s).strip()
+    if not s:
+        return None
+    if s in ("24:00", "24h00", "2400"):
+        return "MIDNIGHT_END"
+    h, m = s.split(":")
+    return time(int(h), int(m))
+
+
+def _shift_windows(site_cfg, d):
+    """Open loading windows (start_dt, end_dt) for calendar day d. A night
+    window ending earlier than it starts crosses midnight into d+1."""
+    from datetime import datetime, timedelta, time
+    wd = d.weekday()
+    if wd <= 4:
+        keys = [("weekday_day", False), ("weekday_night", True)]
+    elif wd == 5:
+        keys = [("sat_day", False), ("sat_night", True)]
+    else:
+        keys = [("sun_day", False), ("sun_night", True)]
+    wins = []
+    for key, is_night in keys:
+        raw = str(site_cfg.get(key) or "").strip()
+        if not raw or "-" not in raw:
+            continue
+        if is_night and DAY_ABBR[wd] in site_cfg.get("skip_night_days", []):
+            continue
+        a, b = raw.split("-", 1)
+        t1, t2 = _parse_hhmm(a), _parse_hhmm(b)
+        if t1 is None or t2 is None or t1 == "MIDNIGHT_END":
+            continue
+        start = datetime.combine(d, t1)
+        if t2 == "MIDNIGHT_END":
+            end = datetime.combine(d + timedelta(days=1), time(0, 0))
         else:
-            st.session_state["rebuild_message"] = ("success",
-                "Rebuilt -- every bundle still physically fits with your chosen truck types.")
-        st.rerun()
+            end = datetime.combine(d, t2)
+            if end <= start:
+                end += timedelta(days=1)   # crosses midnight
+        wins.append((start, end))
+    return sorted(wins)
+
+
+def _next_loading_slot(site_cfg, not_before, dur_h):
+    """Earliest start >= not_before where a full loading of dur_h hours fits
+    inside one open shift window."""
+    from datetime import timedelta
+    dur = timedelta(hours=dur_h)
+    for day_off in range(0, 60):
+        d = (not_before.date() + timedelta(days=day_off))
+        # include yesterday's overnight windows that spill into today
+        wins = _shift_windows(site_cfg, d - timedelta(days=1)) + _shift_windows(site_cfg, d)
+        for s, e in sorted(wins):
+            start = max(s, not_before)
+            if start + dur <= e:
+                return start
+    return not_before  # no configured windows at all -- schedule anyway
+
+
+def write_transport_orders(wb, loads, sites, start_to_no=1000001, cfg=None):
+    """TMS import tab. Per load (load_reference_group TRK001, TRK002...):
+    one PICKUP transport order carrying every SKU line of the load
+    (destination = the first/closest drop), then one TO per customer drop
+    with that customer's lines. Each TO block = 1 main row, 4 window
+    'placeholder' rows (delivery days +1..+4), then remaining SKU lines.
+    Loading day = today + 2; the first load ships 07:00-09:00 and every
+    following load shifts 2 hours later. TO numbers continue sequentially
+    from start_to_no (set in the app to follow your TMS's numbering)."""
+    from datetime import date, datetime, time, timedelta
+    import load_builder as _lb
+
+    cfg = cfg or default_schedule_cfg()
+    ws = wb.create_sheet("Transport Orders")
+    headers = ["Transport Order", "Trip", "load_reference_group", "Status", "Route Type",
+               "Route Code", "Source Location", "Source Location Type", "Destination Location",
+               "Destination Location Type", "Total Weight", "Total Volume", "Total Pallets",
+               "Ship From", "Ship To", "Deliver From", "Deliver To",
+               "Windows/Ship From", "Windows/Ship To", "Windows/Deliver From", "Windows/Deliver To",
+               "Windows/Planning Priority", "Windows/Date From", "Windows/Date To", "External ID",
+               "Lines/Demand Bucket Line/id", "Lines/Demand Bucket/External ID",
+               "Lines/Demand Bucket Line/Line No", "Lines/Item Code", "Lines/Order ID",
+               "Lines/Qty", "Lines/Total volume", "Lines/Total Weight"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = BOLD
+
+    load_date = date.today() + timedelta(days=int(cfg["offset_days"]))
+    to_no = int(start_to_no)
+    del_start = _parse_hhmm(cfg["deliver_start"]) or time(8, 0)
+    del_end = _parse_hhmm(cfg["deliver_end"]) or time(17, 0)
+    site_cursor = {}   # per site: earliest datetime the next load may start
+
+    def fmt(dtv):
+        return dtv.strftime("%Y-%m-%d %H:%M")
+
+    def line_cells(ln):
+        db = getattr(_lb, "DEMAND_BUCKETS", {})
+        b = db.get((_lb._order_digits(ln["sales_order"]), ln["sku"])) or db.get(ln["sku"]) or {}
+        qty = int(round(ln["bundles"] * (ln.get("qty_nop") or 0))) or ln["bundles"]
+        return [b.get("line_id", ""), b.get("bucket_ext", ""), b.get("line_no", ""),
+                ln["sku"], "", qty, round(ln["m3"], 5), round(ln["bundle_kg"] * ln["bundles"], 3)]
+
+    for li, load in enumerate(loads):
+        site = load["site"]
+        scfg = cfg["shifts"].get(site) or {"weekday_day": "00:00-24:00",
+                                           "sat_day": "00:00-24:00", "sun_day": "00:00-24:00",
+                                           "skip_night_days": []}
+        not_before = site_cursor.get(site, datetime.combine(load_date, time(0, 0)))
+        slot = _next_loading_slot(scfg, not_before, cfg["duration_h"])
+        ship_from_dt = slot
+        ship_to_dt = slot + timedelta(hours=cfg["duration_h"])
+        site_cursor[site] = slot + timedelta(hours=cfg["spacing_h"])
+        base = ship_from_dt.date()   # windows are anchored on the actual loading day
+        sf, st_ = fmt(ship_from_dt), fmt(ship_to_dt)
+        trk = "TRK%03d" % (li + 1)
+        source = "SFP-%s - %s" % (site, sites.get(site, {}).get("name") or site)
+
+        cust_lines, cust_dist = {}, {}
+        for ln in load["lines"]:
+            cust_lines.setdefault(ln["location_code"], []).append(ln)
+            cust_dist[ln["location_code"]] = min(cust_dist.get(ln["location_code"], 1e18), ln["dist_km"])
+        drops = sorted(cust_lines, key=lambda c: cust_dist[c])
+
+        def emit(dest_code, dest_name, to_lines, ext_id):
+            nonlocal to_no
+            tot_kg = sum(l["bundle_kg"] * l["bundles"] for l in to_lines)
+            tot_m3 = sum(l["m3"] for l in to_lines)
+            tot_pal = sum(l["bundles"] for l in to_lines)
+            lcells = [line_cells(l) for l in to_lines]
+            # day-one delivery window: from loading end (or the delivery-window
+            # opening, whichever is later) until the configured closing time
+            day1_open = max(ship_to_dt, datetime.combine(base, del_start))
+            day1_close = datetime.combine(base, del_end)
+            if day1_open >= day1_close:
+                day1_open = datetime.combine(base, del_start)
+            ws.append(["TO%d" % to_no, "", trk, "Ready", "OUTBOUND", "",
+                       source, "FACILITY", "%s - %s" % (dest_code, dest_name), "CUSTOMER",
+                       round(tot_kg, 3), round(tot_m3, 5), tot_pal,
+                       sf, st_, st_, fmt(datetime.combine(base + timedelta(days=4), del_end)),
+                       sf, st_, fmt(day1_open), fmt(day1_close), "Must go",
+                       base.isoformat(), base.isoformat(), ext_id] + lcells[0])
+            for k in range(1, 5):
+                d = base + timedelta(days=k)
+                ws.append([""] * 17 + [sf, st_,
+                                       fmt(datetime.combine(d, del_start)),
+                                       fmt(datetime.combine(d, del_end)), "Must go",
+                                       base.isoformat(), d.isoformat()] + [""] * 9)
+            for lc in lcells[1:]:
+                ws.append([""] * 25 + lc)
+            to_no += 1
+
+        first = drops[0]
+        emit(first, cust_lines[first][0]["delivery_name"], load["lines"],
+             cust_lines[first][0]["sales_order"])
+        for code in drops:
+            ls = cust_lines[code]
+            emit(code, ls[0]["delivery_name"], ls, ls[0]["sales_order"])
+
+    for i in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 19
+    ws.freeze_panes = "A2"
+    return ws
+
+
+def _rounded_bundle(ax, x, y, w, h, accent, hatch):
+    pad = min(w, h) * 0.05
+    box = patches.FancyBboxPatch(
+        (x + pad, y + pad), max(w - 2 * pad, 0.01), max(h - 2 * pad, 0.01),
+        boxstyle="round,pad=0,rounding_size=%.4f" % (min(w, h) * 0.06),
+        linewidth=1.3, edgecolor=accent, facecolor="white", hatch=hatch, zorder=3,
+    )
+    ax.add_patch(box)
+
+
+def _badge(ax, x, y, w, h, pct, label):
+    pct_clamped = max(0, min(pct, 100))
+    color = "#2E7D32" if pct_clamped < 70 else ("#B8860B" if pct_clamped < 92 else "#B2323C")
+    ax.add_patch(patches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=%.3f" % (h * 0.4),
+                                         linewidth=1.1, edgecolor=color, facecolor="white", zorder=3))
+    ax.text(x + w / 2, y + h / 2, "%s %.0f%%" % (label, pct_clamped), fontsize=6.2, va="center",
+            ha="center", color=color, fontweight="bold", zorder=4)
+
+
+TEXT_HALO = dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.88)
+
+
+def draw_trailer(ax, trailer_info, title, style_map, seq_map):
+    spec = trailer_info["spec"]
+    length_cap, height_cap = spec["length_m"], spec["height_m"]
+    # Draw exactly as many lanes as this trailer actually has (2 for a
+    # standard tautliner, 1 for e.g. a single-stack Flat Deck) instead of
+    # always assuming 2 -- otherwise a single-lane trailer would show a
+    # phantom empty second lane.
+    n_slots = max(1, int(spec.get("width_slots", 2)))
+    lane_pitch = height_cap * 1.2
+    lanes_height = height_cap + lane_pitch * (n_slots - 1)
+    if n_slots == 2:
+        lane_names = ["LEFT", "RIGHT"]
+    elif n_slots == 1:
+        lane_names = [""]
+    else:
+        lane_names = ["LANE %d" % (i + 1) for i in range(n_slots)]
+    top_pad = height_cap * 0.55
+    ax.set_xlim(-0.6, length_cap + 0.3)
+    ax.set_ylim(-0.55, lanes_height + top_pad)
+    ax.axis("off")
+
+    ax.text(length_cap / 2, lanes_height + top_pad * 0.68, title,
+            fontsize=12, fontweight="bold", ha="center", color=NAVY)
+
+    weight_pct = trailer_info["used_weight"] / (spec["weight_cap_t"] * 1000) * 100
+    length_pct = trailer_info["used_length"] / spec["length_m"] * 100
+    cube_pct = trailer_info["used_volume"] / trailer_info["cube_cap_m3"] * 100 if trailer_info["cube_cap_m3"] else 0
+    badge_w = length_cap * 0.30
+    badge_h = top_pad * 0.20
+    badge_y = lanes_height + top_pad * 0.10
+    gap = (length_cap - 3 * badge_w) / 2
+    _badge(ax, 0, badge_y, badge_w, badge_h, weight_pct, "WT")
+    _badge(ax, badge_w + gap, badge_y, badge_w, badge_h, cube_pct, "CUBE")
+    _badge(ax, 2 * (badge_w + gap), badge_y, badge_w, badge_h, length_pct, "FLOOR")
+
+    for slot_idx in range(n_slots):
+        lane_label = lane_names[slot_idx]
+        y0 = lane_pitch * slot_idx
+        ax.add_patch(patches.FancyBboxPatch((0, y0), length_cap, height_cap,
+                                             boxstyle="round,pad=0,rounding_size=0.08", linewidth=1.3,
+                                             edgecolor=STEEL, facecolor="none", zorder=0))
+        # height scale (m) from the truck's own dimensions, on the left edge
+        hticks = list(range(0, int(height_cap) + 1))
+        if height_cap - int(height_cap) > 1e-9:
+            hticks.append(height_cap)
+        for hval in hticks:
+            y = y0 + hval
+            ax.plot([-0.10, 0], [y, y], color="#888888", linewidth=0.8, zorder=1)
+            ax.text(-0.16, y, "%g" % hval, fontsize=5.5, ha="right", va="center", color="#555555")
+        # lane name rotated (reads bottom-to-top), centred on its lane box
+        if lane_label:
+            ax.text(-0.62, y0 + height_cap / 2, lane_label, rotation=90, va="center", ha="center",
+                    fontsize=8, color=STEEL, fontweight="bold")
+
+    # Bundles too small for even the "#N" one-line label to sit comfortably
+    # get collected here -- their full order/SKU/customer details are never
+    # simply dropped, just moved to a compact callout list below the axis.
+    # This should be rare (only the very shortest bundles).
+    tiny_notes = []
+
+    for p in trailer_info["placements"]:
+        y_offset = lane_pitch * p["slot"]
+        y = y_offset + p["y"]
+        accent, hatch = style_map.get(p.get("location_code"), (ACCENTS[0], HATCHES[0]))
+        _rounded_bundle(ax, p["x"], y, p["bundle_length_m"], p["bundle_height_m"], accent, hatch)
+        seq_no = seq_map.get(p.get("location_code"), (0, "", 0))[0]
+        so_short = p["sales_order"].replace("SFP-", "").replace("-SO", "")
+        h = p["bundle_height_m"]
+        w = p["bundle_length_m"]
+        if w < 1.05 or h < 0.16:
+            label = "#%d" % seq_no
+            fontsize = max(5.5, min(8.0, min(w, h) * 22))
+            tiny_notes.append((seq_no, so_short, p["sku"], p["delivery_name"]))
+        elif h >= 0.32:
+            label = "#%d\nOrd %s\nSKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
+            fontsize = max(4.0, min(6.0, h * 13))
+        else:
+            label = "#%d Ord %s | SKU %s\n%s" % (seq_no, so_short, p["sku"], p["delivery_name"][:20])
+            fontsize = max(3.8, min(5.6, h * 15))
+        clip_box = patches.Rectangle((p["x"], y), p["bundle_length_m"], p["bundle_height_m"], transform=ax.transData)
+        ax.text(p["x"] + p["bundle_length_m"] / 2, y + p["bundle_height_m"] / 2, label,
+                ha="center", va="center", fontsize=fontsize, color=INK, fontweight="bold",
+                zorder=4, linespacing=1.0, clip_path=clip_box, clip_on=True, bbox=TEXT_HALO)
+
+    # numeric length-axis scale along the bottom, plus a light chassis line
+    ax.plot([-0.2, length_cap + 0.1], [-0.18, -0.18], color="#888888", linewidth=1.6, zorder=1)
+    for wx in [length_cap * 0.18, length_cap * 0.5, length_cap * 0.82]:
+        ax.add_patch(patches.Circle((wx, -0.18), 0.10, facecolor="none", edgecolor="#333333", linewidth=1.2, zorder=1))
+    tick_step = 1 if length_cap <= 8 else 2
+    tick = 0
+    while tick <= length_cap + 1e-6:
+        ax.plot([tick, tick], [-0.26, -0.20], color="#888888", linewidth=1.0, zorder=1)
+        ax.text(tick, -0.48, "%g" % tick, fontsize=6.5, ha="center", color="#555555")
+        tick += tick_step
+
+    if tiny_notes:
+        seen, unique_notes = set(), []
+        for note in tiny_notes:
+            key = (note[0], note[2])  # (seq_no, sku) -- same customer can have >1 tiny SKU
+            if key not in seen:
+                seen.add(key)
+                unique_notes.append(note)
+        ylo, yhi = ax.get_ylim()
+        extra_h = 0.20 + 0.20 * len(unique_notes)
+        ax.set_ylim(ylo - extra_h, yhi)
+        ax.text(length_cap / 2, -0.62, "Too small to label in place:",
+                fontsize=6.2, ha="center", color="#777777", style="italic")
+        for i, (seq_no, so_short, sku, name) in enumerate(unique_notes):
+            ax.text(length_cap / 2, -0.62 - 0.20 * (i + 1),
+                    "#%d  Ord %s | SKU %s | %s" % (seq_no, so_short, sku, name),
+                    fontsize=6.2, ha="center", color="#333333")
+
+
+def _draw_top_legend(fig, load, style_map, seq_map, rect):
+    ax = fig.add_axes(rect)
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    items = sorted(seq_map.items(), key=lambda kv: kv[1][0])
+    n = max(len(items), 1)
+    per_row = min(n, 5)
+    col_w = 1.0 / per_row
+    for i, (code, (seq_no, name, dist)) in enumerate(items):
+        row = i // per_row
+        col = i % per_row
+        x = col * col_w
+        y = 0.88 - row * 0.5
+        accent, hatch = style_map.get(code, (ACCENTS[0], HATCHES[0]))
+        ax.add_patch(patches.FancyBboxPatch((x, y - 0.12), 0.028, 0.20, boxstyle="round,pad=0,rounding_size=0.01",
+                                             linewidth=1.0, edgecolor=accent, facecolor="white", hatch=hatch,
+                                             clip_on=False))
+        ax.text(x + 0.045, y - 0.02, "#%d  %s (%.0f km)" % (seq_no, (name or code)[:24], dist),
+                fontsize=6.6, va="center", color="#333333")
+
+
+def write_schematics_pdf(loads, path):
+    n_total = len(loads)
+    with PdfPages(path) as pdf:
+        for page_no, load in enumerate(loads, start=1):
+            fig = plt.figure(figsize=(11.7, 8.3))
+            fig.patch.set_facecolor("white")
+
+            header_ax = fig.add_axes([0, 0.93, 1, 0.07])
+            header_ax.axis("off")
+            header_ax.add_patch(patches.Rectangle((0, 0), 1, 0.05, transform=header_ax.transAxes,
+                                                   facecolor=NAVY, edgecolor="none"))
+            header_ax.text(0.01, 0.62, "LOAD %s" % load["load_id"], fontsize=17, fontweight="bold",
+                            color=NAVY, va="center", transform=header_ax.transAxes)
+            n_orders = len({ln["sales_order"] for ln in load["lines"]})
+            n_skus = len({ln["sku"] for ln in load["lines"]})
+            total_bundles = sum(ln["bundles"] for ln in load["lines"])
+            placed_bundles = total_bundles - len(load["pack_leftover"])
+            subtitle = ("Site: %s   |   %s   |   Truck: %s   |   %.1f m3, %.0f kg   |   "
+                        "%s orders, %s SKUs, %s drops, %s lines   |   %d/%d bundles placed" % (
+                load["site"], group_label(load["group"]), truck_display_name(load["truck_type"]), load["total_m3"], load["total_kg"],
+                n_orders, n_skus, load["n_customers"], len(load["lines"]), placed_bundles, total_bundles))
+            header_ax.text(0.01, 0.22, subtitle, fontsize=9, color="#444444", va="center",
+                            transform=header_ax.transAxes)
+
+            seq_map = _drop_sequence(load)
+            style_map = _customer_style_map(load)
+            _draw_top_legend(fig, load, style_map, seq_map, [0.01, 0.80, 0.98, 0.12])
+
+            plot_area_width = 0.98
+            names = list(load["packing"].keys())
+            spans = [load["packing"][name]["spec"]["length_m"] + 0.9 for name in names]
+            total_span = sum(spans)
+            x_cursor = 0.01
+            trailer_top = 0.70
+            for i, name in enumerate(names):
+                w = plot_area_width * spans[i] / total_span
+                ax = fig.add_axes([x_cursor, 0.08, w - 0.02, trailer_top])
+                draw_trailer(ax, load["packing"][name], "%s TRAILER" % name.upper(), style_map, seq_map)
+                x_cursor += w
+
+            footer_ax = fig.add_axes([0, 0, 1, 0.03])
+            footer_ax.axis("off")
+            footer_ax.text(0.99, 0.5, "Page %d of %d" % (page_no, n_total), fontsize=7.5, color="#999999",
+                            ha="right", va="center", transform=footer_ax.transAxes)
+            footer_ax.text(0.5, 0.5, "Build %s" % APP_VERSION, fontsize=7.5, color="#999999",
+                           ha="center", va="center")
+            footer_ax.text(0.01, 0.5, "Generated load-building schematic -- verify against physical stock before dispatch",
+                            fontsize=7, color="#AAAAAA", ha="left", va="center", transform=footer_ax.transAxes)
+
+            pdf.savefig(fig, orientation="landscape")
+            plt.close(fig)
+
+
+if __name__ == "__main__":
+    loads, unassigned, fleet_left, lines, sites = build_all()
 
     wb = openpyxl.Workbook()
     write_loads_summary(wb, loads, unassigned)
     write_orders_summary(wb, loads, unassigned)
-    if use_demand_buckets:
-        write_transport_orders(wb, loads, sites, to_start, sched)
-    xlsx_buf = io.BytesIO()
-    wb.save(xlsx_buf)
-    xlsx_buf.seek(0)
+    write_transport_orders(wb, loads, sites)
+    wb.save("Load Building Output.xlsx")
+    print("Wrote Load Building Output.xlsx")
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-        write_schematics_pdf(loads, tmp.name)
-        tmp.seek(0)
-        pdf_bytes = tmp.read()
+    write_schematics_pdf(loads, "Load Schematics.pdf")
+    print("Wrote Load Schematics.pdf")
 
-    tabs_note = ("Loads Summary, Orders Line Summary, Transport Orders" if use_demand_buckets
-                 else "Loads Summary, Orders Line Summary (no Transport Orders tab -- unticked above)")
-    st.caption(f"Excel tabs included: {tabs_note}")
-
-    dcol1, dcol2 = st.columns(2)
-    dcol1.download_button("Download Load Building Output.xlsx", xlsx_buf,
-                           file_name="Load Building Output.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    dcol2.download_button("Download Load Schematics.pdf", pdf_bytes,
-                           file_name="Load Schematics.pdf", mime="application/pdf")
-elif not have_file:
-    st.info("Upload your workbook above to get started.")
+    print("Summary: %d loads, %d unassigned lines, fleet left: %s" % (len(loads), len(unassigned), fleet_left))
