@@ -13,19 +13,21 @@ import openpyxl
 import pandas as pd
 
 import load_builder as lb
+import matplotlib.pyplot as plt
+
 from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
-                           default_schedule_cfg, DAY_ABBR)
+                           render_load_figure, default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v39 (18 Jul 2026)"
+APP_VERSION = "v40 (18 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v39":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v39. "
+if lb_ver != "v40":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v40. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v39, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v40, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -195,6 +197,7 @@ if have_file and st.button("Build Loads", type="primary"):
         "build_everything": build_everything,
     }
     st.session_state["truck_overrides"] = {}  # fresh load IDs -- clear any stale overrides
+    st.session_state["load_edits"] = {}       # manual bundle moves are per-build too
 
 if "result" in st.session_state:
     res = st.session_state["result"]
@@ -295,8 +298,7 @@ if "result" in st.session_state:
 
     if st.button("Rebuild with these truck types"):
         id_to_truck = dict(st.session_state["truck_overrides"])
-        changed_ids = [lid for lid, t in id_to_truck.items() if t != next(
-            (l["truck_type"] for l in loads if l["load_id"] == lid), t)]
+        st.session_state["load_edits"] = {}  # truck change invalidates manual pins
         # Re-plan every CHANGED load against a shared unassigned pool, so a
         # load resized to a bigger truck can pick up nearby freight that an
         # earlier override just evicted (or that was already unassigned),
@@ -340,6 +342,130 @@ if "result" in st.session_state:
         else:
             msg_lines.append("Every bundle still physically fits with your chosen truck types.")
             st.session_state["rebuild_message"] = ("success", " ".join(msg_lines))
+        st.rerun()
+
+    st.subheader("Interactive load editor")
+    st.caption(
+        "Pick a load, then rearrange its bundles: swap two bundles or move one to a "
+        "specific trailer/lane. Your moved bundle is pinned where you put it and the "
+        "rest of the load re-flows around it for the tightest fit -- evening out layer "
+        "heights often frees room. After every change (and with the Optimize button) the "
+        "app automatically tries to fit this load's excluded bundles AND any unassigned "
+        "freight that matches this load's corridor and due-date rules into the freed "
+        "space. All downloads below always reflect what you see here."
+    )
+
+    edits_all = st.session_state.setdefault("load_edits", {})
+    sel_lid = st.selectbox("Load to edit", [l["load_id"] for l in loads],
+                           format_func=lambda lid: "%s  (%s)" % (lid, next(
+                               lb.truck_display_name(l["truck_type"]) for l in loads if l["load_id"] == lid)),
+                           key="edit_load_sel")
+    eload = next(l for l in loads if l["load_id"] == sel_lid)
+    edits = edits_all.setdefault(sel_lid, {"pins": {}, "strategy": None})
+
+    if "editor_message" in st.session_state:
+        kind, msg = st.session_state.pop("editor_message")
+        getattr(st, kind)(msg)
+
+    fig = render_load_figure(eload, show_uids=True)
+    st.pyplot(fig)
+    plt.close(fig)
+
+    for w in lb.drop_balance_report(eload):
+        st.warning(w)
+    if eload["pack_leftover"]:
+        st.error("%d bundle(s) on this load's paperwork do NOT physically fit right now -- "
+                 "rearranging or Optimize may recover them." % len(eload["pack_leftover"]))
+
+    # Bundle inventory, in bid order, for the move controls below
+    placements = []
+    for tname, tinfo in eload["packing"].items():
+        two_lanes = len({pp["slot"] for pp in tinfo["placements"]} | {0, 1}) <= 2
+        for p in tinfo["placements"]:
+            lane = ("LEFT" if p["slot"] == 0 else "RIGHT") if two_lanes else "LANE %d" % (p["slot"] + 1)
+            placements.append({
+                "bid": p["bid"], "uid": p["uid"], "trailer": tname, "slot": p["slot"],
+                "Bundle": "b%d" % p["bid"], "Trailer": tname, "Lane": lane,
+                "From (m)": round(p["x"], 2), "Length (m)": round(p["bundle_length_m"], 2),
+                "Order": p["sales_order"].replace("SFP-", "").replace("-SO", ""),
+                "SKU": p["sku"], "Customer": p["delivery_name"], "KG": round(p["bundle_kg"]),
+            })
+    placements.sort(key=lambda r: r["bid"])
+    st.dataframe([{k: r[k] for k in ("Bundle", "Trailer", "Lane", "From (m)", "Length (m)",
+                                       "Order", "SKU", "Customer", "KG")} for r in placements],
+                 width="stretch", height=240)
+    by_bid = {r["bid"]: r for r in placements}
+    bids = [r["bid"] for r in placements]
+    trailer_names = list(eload["packing"].keys())
+
+    mc1, mc2, mc3, mc4 = st.columns([1.1, 1.3, 1.6, 1.0])
+    with mc1:
+        sel_bid = st.selectbox("Bundle", bids, format_func=lambda b: "b%d" % b, key="ed_bid")
+    with mc2:
+        action = st.selectbox("Action", ["Swap with bundle...", "Move to trailer/lane..."], key="ed_act")
+    with mc3:
+        if action.startswith("Swap"):
+            other = st.selectbox("Swap with", [b for b in bids if b != sel_bid],
+                                 format_func=lambda b: "b%d" % b, key="ed_other")
+            tgt_trailer = tgt_slot = None
+        else:
+            tgt_trailer = st.selectbox("To trailer", trailer_names, key="ed_tt")
+            n_lanes = max(1, int(eload["packing"][tgt_trailer]["spec"].get("width_slots", 2)))
+            lane_opts = list(range(n_lanes))
+            tgt_slot = st.selectbox("Lane", lane_opts,
+                                    format_func=lambda s: ("LEFT" if s == 0 else "RIGHT") if n_lanes == 2
+                                    else "LANE %d" % (s + 1), key="ed_tl")
+            other = None
+    with mc4:
+        st.write("")  # vertical spacer so the button lines up with the inputs
+        apply_move = st.button("Apply move", key="ed_apply")
+
+    oc1, oc2 = st.columns(2)
+    do_optimize = oc1.button("Optimize this load (auto-even layers + refit excluded)", key="ed_opt")
+    do_reset = oc2.button("Reset this load to automatic packing", key="ed_reset")
+
+    def _finish_edit(headline):
+        added = lb.refit_from_pool(eload, res["unassigned"],
+                                   pins=edits["pins"], unit_sort=edits["strategy"])
+        st.session_state["result"]["unassigned"] = res["unassigned"]
+        parts = [headline]
+        if added:
+            parts.append("Freed space refitted %d unassigned line(s): %s." % (
+                len(added), "; ".join("%s %s x%d" % (
+                    ln["delivery_name"][:20], ln["sku"], ln["bundles"]) for ln in added)))
+        nleft = len(eload["pack_leftover"])
+        parts.append("%d bundle(s) still not placed on this load." % nleft if nleft
+                     else "Every bundle on this load is now physically placed.")
+        st.session_state["editor_message"] = ("success" if not nleft else "warning", " ".join(parts))
+        st.rerun()
+
+    if apply_move:
+        a = by_bid[sel_bid]
+        if action.startswith("Swap"):
+            b = by_bid[other]
+            edits["pins"][a["uid"]] = (b["trailer"], b["slot"])
+            edits["pins"][b["uid"]] = (a["trailer"], a["slot"])
+            headline = "Swapped b%d and b%d (each pinned to the other's trailer/lane; rest re-flowed)." % (
+                sel_bid, other)
+        else:
+            edits["pins"][a["uid"]] = (tgt_trailer, tgt_slot)
+            headline = "Moved b%d to %s trailer (pinned; rest re-flowed)." % (sel_bid, tgt_trailer)
+        packing, leftover = lb.pack_load(eload, pins=edits["pins"], unit_sort=edits["strategy"])
+        eload["packing"], eload["pack_leftover"] = packing, leftover
+        _finish_edit(headline)
+
+    if do_optimize:
+        strat, improved = lb.optimize_load_packing(eload, pins=edits["pins"])
+        edits["strategy"] = strat
+        headline = ("Optimizer found a better arrangement (strategy: %s)." % strat if improved
+                    else "Optimizer confirmed the current arrangement is already the best it can find.")
+        _finish_edit(headline)
+
+    if do_reset:
+        edits_all[sel_lid] = {"pins": {}, "strategy": None}
+        packing, leftover = lb.pack_load(eload)
+        eload["packing"], eload["pack_leftover"] = packing, leftover
+        st.session_state["editor_message"] = ("info", "Manual changes cleared -- %s repacked automatically." % sel_lid)
         st.rerun()
 
     wb = openpyxl.Workbook()
