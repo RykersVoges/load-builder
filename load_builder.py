@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v37"
+LB_VERSION = "v38"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -47,6 +47,7 @@ MIN_VOL_UTIL_PCT = 75.0
 
 TRUCK_TYPES = {
     "34T": {
+        "display_name": "34 Ton Tautliner",
         "trailers": [
             {"name": "front", "length_m": 6, "weight_cap_t": 12, "width_m": 2.5, "height_m": 2.6},
             {"name": "rear",  "length_m": 12, "weight_cap_t": 24, "width_m": 2.5, "height_m": 2.6},
@@ -57,27 +58,32 @@ TRUCK_TYPES = {
     },
     "FD": {
         # Flat Deck -- placeholder single-trailer spec until the uploaded
-        # Truck Dimensions tab's own "Flat Deck" column overrides these
-        # (see _apply_truck_dimensions). Defaults to 0 in the fleet so it
-        # has no effect unless the user actually owns some.
+        # Truck Dimensions tab's own "34 Ton Flat Deck" (or similar) column
+        # overrides these, including display_name itself (see
+        # _apply_truck_dimensions). Defaults to 0 in the fleet so it has no
+        # effect unless the user actually owns some.
+        "display_name": "34 Ton Flat Deck",
         "trailers": [{"name": "single", "length_m": 12.5, "weight_cap_t": 34, "width_m": 2.5, "height_m": 2.6}],
         "payload_cap_t": 34, "cube_cap_m3": 100,
         "min_weight_t": 26, "min_vol_m3": 45,
         "fleet_count": 0,
     },
     "30T": {
+        "display_name": "30 Ton Tri Axle Tautliner",
         "trailers": [{"name": "single", "length_m": 18, "weight_cap_t": 30, "width_m": 2.5, "height_m": 2.6}],
         "payload_cap_t": 30, "cube_cap_m3": 117,
         "min_weight_t": 23, "min_vol_m3": 48,
         "fleet_count": 0,
     },
     "14T": {
+        "display_name": "14 Ton Tautliner",
         "trailers": [{"name": "single", "length_m": 14, "weight_cap_t": 14, "width_m": 2.5, "height_m": 2.6}],
         "payload_cap_t": 14, "cube_cap_m3": 91,
         "min_weight_t": 11, "min_vol_m3": 20,
         "fleet_count": 0,
     },
     "8T": {
+        "display_name": "8 Ton Tautliner",
         "trailers": [{"name": "single", "length_m": 8, "weight_cap_t": 8, "width_m": 2.5, "height_m": 2.5}],
         "payload_cap_t": 8, "cube_cap_m3": 50,
         "min_weight_t": 6, "min_vol_m3": 12,
@@ -85,6 +91,16 @@ TRUCK_TYPES = {
     },
 }
 TRUCK_TRY_ORDER = ["34T", "FD", "30T", "14T", "8T"]
+
+
+def truck_display_name(key):
+    """Human-readable name for a truck type key, e.g. '34T' -> '34 Ton
+    Tautliner' -- picked up from the uploaded Truck Dimensions tab's own
+    column header if present, otherwise a sensible default."""
+    spec = TRUCK_TYPES.get(key)
+    if not spec:
+        return key
+    return spec.get("display_name") or key
 
 SITE_ALIAS = {"SFP_LSM": "LSM", "SFP_WSM": "WSM"}
 SITE_SWAP = {"LSM": "WSM", "WSM": "LSM"}
@@ -214,6 +230,7 @@ def _apply_truck_dimensions(wb):
     if hdr_i is None:
         return
     col_truck = {}
+    col_header_text = {}
     for j, v in enumerate(rows[hdr_i]):
         if j == desc_col or v is None:
             continue
@@ -222,10 +239,19 @@ def _apply_truck_dimensions(wb):
             # e.g. "Flat Deck", "Flatbed" -- no leading tonnage number, so
             # match on keyword instead of the digit-prefix rule below.
             col_truck[j] = "FD"
+            col_header_text[j] = str(v).strip()
             continue
         m = re.match(r"\s*(\d+)", str(v))
         if m and (m.group(1) + "T") in TRUCK_TYPES:
             col_truck[j] = m.group(1) + "T"
+            col_header_text[j] = str(v).strip()
+    # Use the workbook's own column header text as the display name
+    # everywhere in the app -- e.g. "34 Ton Flat Deck" rather than the
+    # internal key "FD" -- so the Loads table, Excel output, and PDF match
+    # exactly what the user's own truck master calls each type.
+    for j, key in col_truck.items():
+        if col_header_text.get(j):
+            TRUCK_TYPES[key]["display_name"] = col_header_text[j]
     vals = {key: {} for key in col_truck.values()}
     for r in rows[hdr_i + 1:]:
         d = _norm(r[desc_col]) if desc_col < len(r) else ""
