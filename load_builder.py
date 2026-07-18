@@ -23,7 +23,7 @@ from collections import defaultdict
 
 import openpyxl
 
-LB_VERSION = "v39"
+LB_VERSION = "v40"
 INPUT_FILE = "Claude Input File.xlsx"
 
 DIRECTION_DEGREES = 30
@@ -1014,18 +1014,22 @@ LEVEL_TOL = 0.05   # adjacent stacks within 5 cm of the same height count as
                    # bearers, letting a long bundle lie across two stacks.
 
 
-def _try_place_unit(state, trailer_spec, u):
+def _try_place_unit(state, trailer_spec, u, allowed_slots=None):
     """Best-fit skyline placement. A bundle may rest within one shelf
     segment OR span a run of consecutive near-level segments (real loading
     practice: a 6m bundle lies across two level 3m stacks). Leftover shelf
-    length beside a shorter bundle stays open for later bundles."""
+    length beside a shorter bundle stays open for later bundles.
+    `allowed_slots` restricts placement to specific lane index(es) -- used
+    by the interactive editor to pin a bundle to a chosen lane."""
     height_cap = trailer_spec["height_m"]
     weight_cap = trailer_spec["weight_cap_t"] * 1000
     if state["used_weight"] + u["bundle_kg"] > weight_cap:
         return False
 
     best = None
-    for slot_idx in range(len(state["skyline"])):
+    slot_range = range(len(state["skyline"])) if allowed_slots is None else \
+        [s for s in allowed_slots if 0 <= s < len(state["skyline"])]
+    for slot_idx in slot_range:
         slot = state["skyline"][slot_idx]
         for i in range(len(slot)):
             if slot[i]["x1"] - slot[i]["x0"] <= 1e-9:
@@ -1103,21 +1107,70 @@ def _expand_units(bundles):
         for _ in range(int(b["bundles"])):
             units.append(dict(b))
     units.sort(key=lambda u: (-u["bundle_length_m"], -u["bundle_kg"]))
+    # Stable unit id: k-th identical bundle of (order, sku, customer).
+    # Identical units are physically interchangeable, so pinning "the k-th
+    # unit of kind X" stays meaningful across repacks even if the load's
+    # line set grows or shrinks.
+    counts = defaultdict(int)
+    for u in units:
+        k = (u["sales_order"], u["sku"], u["location_code"])
+        u["uid"] = "%s|%s|%s#%d" % (k[0], k[1], k[2], counts[k])
+        counts[k] += 1
     return units
 
 
-def pack_trailer(trailer_spec, bundles):
-    """Single-trailer packer (kept for compatibility / single-trailer trucks)."""
-    units = _expand_units(bundles)
+def _order_units(units, unit_sort):
+    """Re-order units for a packing attempt. Default (None/'length') keeps
+    the longest-first order; other strategies give the optimizer different
+    starting sequences to search over."""
+    if not unit_sort or unit_sort == "length":
+        return units
+    if unit_sort == "height":
+        units.sort(key=lambda u: (-u["bundle_height_m"], -u["bundle_length_m"], -u["bundle_kg"]))
+    elif unit_sort == "weight":
+        units.sort(key=lambda u: (-u["bundle_kg"], -u["bundle_length_m"]))
+    elif unit_sort == "volume":
+        units.sort(key=lambda u: (-u.get("bundle_cubes_m3", 0), -u["bundle_length_m"]))
+    elif unit_sort.startswith("seed"):
+        import random
+        random.Random(int(unit_sort[4:])).shuffle(units)
+    return units
+
+
+def pack_trailer(trailer_spec, bundles, pins=None, unit_sort=None):
+    """Single-trailer packer (kept for compatibility / single-trailer trucks).
+    `pins` maps unit uid -> (trailer_name, slot_idx or None): pinned units are
+    placed first, restricted to their chosen lane, then the rest re-flow
+    around them."""
+    units = _order_units(_expand_units(bundles), unit_sort)
     state = _new_trailer_state(trailer_spec)
+    pins = pins or {}
     leftover = []
-    for u in units:
+    pinned = [u for u in units if u["uid"] in pins]
+    rest = [u for u in units if u["uid"] not in pins]
+    for u in pinned:
+        _, slot = pins[u["uid"]]
+        if not _try_place_unit(state, trailer_spec, u,
+                               allowed_slots=None if slot is None else [slot]):
+            rest.append(u)  # pin impossible -- fall back to normal placement
+    for u in rest:
         if not _try_place_unit(state, trailer_spec, u):
             leftover.append(u)
     return state["placements"], leftover, _used_length(state), state["used_weight"], state["used_volume"]
 
 
-def pack_load(load):
+def _assign_bids(packing):
+    """Sequential display numbers (b1, b2, ...) across a load's trailers so
+    the on-screen editor and schematic can reference individual bundles."""
+    bid = 1
+    for name in packing:
+        for p in sorted(packing[name]["placements"], key=lambda p: (p["slot"], p["x"], p["y"])):
+            p["bid"] = bid
+            bid += 1
+    return packing
+
+
+def pack_load(load, pins=None, unit_sort=None):
     spec = TRUCK_TYPES[load["truck_type"]]
     trailers = spec["trailers"]
     total_trailer_length = sum(t["length_m"] for t in trailers)
@@ -1134,19 +1187,41 @@ def pack_load(load):
         })
 
     if len(trailers) == 1:
-        placements, leftover, used_len, used_wt, used_vol = pack_trailer(trailers[0], bundle_recs)
-        return {trailers[0]["name"]: {
+        placements, leftover, used_len, used_wt, used_vol = pack_trailer(
+            trailers[0], bundle_recs, pins=pins, unit_sort=unit_sort)
+        packing = {trailers[0]["name"]: {
             "placements": placements, "spec": trailers[0],
             "used_length": used_len, "used_weight": used_wt, "used_volume": used_vol,
             "cube_cap_m3": spec["cube_cap_m3"],
-        }}, leftover
+        }}
+        return _assign_bids(packing), leftover
 
     front_spec = next(t for t in trailers if t["name"] == "front")
     rear_spec = next(t for t in trailers if t["name"] == "rear")
     front_state = _new_trailer_state(front_spec)
     rear_state = _new_trailer_state(rear_spec)
 
-    units = _expand_units(bundle_recs)
+    units = _order_units(_expand_units(bundle_recs), unit_sort)
+    pins = pins or {}
+    trailer_states = {"front": (front_state, front_spec), "rear": (rear_state, rear_spec)}
+
+    # Pinned units first: each goes into its chosen trailer (and lane, if
+    # given); the automatic balanced flow below then re-flows everything
+    # else around them. A pin that physically can't be honoured falls back
+    # to normal placement rather than dropping the bundle.
+    pinned_units = [u for u in units if u["uid"] in pins]
+    units = [u for u in units if u["uid"] not in pins]
+    failed_pins = []
+    for u in pinned_units:
+        tname, slot = pins[u["uid"]]
+        st_sp = trailer_states.get(tname)
+        ok = False
+        if st_sp is not None:
+            ok = _try_place_unit(st_sp[0], st_sp[1], u,
+                                 allowed_slots=None if slot is None else [slot])
+        if not ok:
+            failed_pins.append(u)
+    units = failed_pins + units
 
     # Balanced two-trailer allocation: give every DROP a presence in BOTH
     # trailers, in proportion to each trailer's weight capacity (1/3 front,
@@ -1156,6 +1231,11 @@ def pack_load(load):
     front_share = front_spec["weight_cap_t"] / (front_spec["weight_cap_t"] + rear_spec["weight_cap_t"])
     drop_front_kg = defaultdict(float)
     drop_total_kg = defaultdict(float)
+    for p in front_state["placements"]:
+        drop_front_kg[p["location_code"]] += p["bundle_kg"]
+        drop_total_kg[p["location_code"]] += p["bundle_kg"]
+    for p in rear_state["placements"]:
+        drop_total_kg[p["location_code"]] += p["bundle_kg"]
 
     leftover = []
     for u in units:
@@ -1187,14 +1267,121 @@ def pack_load(load):
     front_cube_cap = spec["cube_cap_m3"] * front_spec["length_m"] / total_trailer_length
     rear_cube_cap = spec["cube_cap_m3"] * rear_spec["length_m"] / total_trailer_length
 
-    return {
+    packing = {
         "front": {"placements": front_state["placements"], "spec": front_spec,
                   "used_length": _used_length(front_state), "used_weight": front_state["used_weight"],
                   "used_volume": front_state["used_volume"], "cube_cap_m3": front_cube_cap},
         "rear": {"placements": rear_state["placements"], "spec": rear_spec,
                  "used_length": _used_length(rear_state), "used_weight": rear_state["used_weight"],
                  "used_volume": rear_state["used_volume"], "cube_cap_m3": rear_cube_cap},
-    }, leftover
+    }
+    return _assign_bids(packing), leftover
+
+
+def drop_balance_report(load):
+    """Warnings (not errors) for drops whose weight sits much more heavily
+    in one trailer than the balanced front/rear share -- the risk case is a
+    nearly-empty front trailer pulling a still-full rear as the route is
+    unloaded drop by drop. Only meaningful for two-trailer trucks."""
+    packing = load.get("packing") or {}
+    if "front" not in packing or "rear" not in packing:
+        return []
+    f_spec = packing["front"]["spec"]
+    r_spec = packing["rear"]["spec"]
+    share = f_spec["weight_cap_t"] / (f_spec["weight_cap_t"] + r_spec["weight_cap_t"])
+    front_kg = defaultdict(float)
+    total_kg = defaultdict(float)
+    names = {}
+    for p in packing["front"]["placements"]:
+        front_kg[p["location_code"]] += p["bundle_kg"]
+        total_kg[p["location_code"]] += p["bundle_kg"]
+        names[p["location_code"]] = p.get("delivery_name") or p["location_code"]
+    for p in packing["rear"]["placements"]:
+        total_kg[p["location_code"]] += p["bundle_kg"]
+        names.setdefault(p["location_code"], p.get("delivery_name") or p["location_code"])
+    warnings = []
+    for code, tot in total_kg.items():
+        if tot < 500:
+            continue  # too light to matter for balance
+        frac = front_kg[code] / tot
+        if abs(frac - share) > 0.35:
+            where = "front" if frac > share else "rear"
+            warnings.append(
+                "Drop balance: %s has %.0f%% of its %.0f kg in the %s trailer "
+                "(balanced would be ~%.0f%% front) -- fine if intentional, but the %s "
+                "trailer will empty much faster at that stop." % (
+                    names[code], frac * 100, tot, "front" if frac > share else "rear",
+                    share * 100, where))
+    return warnings
+
+
+def refit_from_pool(load, unassigned_pool, pins=None, unit_sort=None):
+    """Try to fill spare space on an already-packed load with freight from
+    the unassigned pool -- same site + corridor/direction/province rule the
+    load was built under, oldest due first. A candidate line is kept only
+    if the physical repack places EVERY one of its bundles without bumping
+    anything already placed. Mutates load and pool; returns list of lines
+    that were added."""
+    spec = TRUCK_TYPES[load["truck_type"]]
+    cap_kg = spec["payload_cap_t"] * 1000
+    cap_m3 = spec["cube_cap_m3"]
+    baseline_left = len(load.get("pack_leftover") or [])
+    added = []
+    candidates = [ln for ln in unassigned_pool if _line_fits_load_group(ln, load)]
+    candidates.sort(key=lambda x: (x["due"] is None, x["due"]))
+    for ln in candidates:
+        add_kg = ln["bundle_kg"] * ln["bundles"]
+        if load["total_kg"] + add_kg > cap_kg + 1e-6 or load["total_m3"] + ln["m3"] > cap_m3 + 1e-6:
+            continue
+        cust = {l["location_code"] for l in load["lines"]}
+        if ln["location_code"] not in cust and len(cust) >= MAX_DROPS_PER_LOAD:
+            continue
+        trial = dict(load)
+        trial["lines"] = load["lines"] + [ln]
+        packing, leftover = pack_load(trial, pins=pins, unit_sort=unit_sort)
+        if len(leftover) > baseline_left:
+            continue  # didn't physically fit (or bumped something) -- skip
+        load["lines"] = trial["lines"]
+        load["total_kg"] += add_kg
+        load["total_m3"] += ln["m3"]
+        load["n_customers"] = len({l["location_code"] for l in load["lines"]})
+        load["packing"] = packing
+        load["pack_leftover"] = leftover
+        baseline_left = len(leftover)
+        unassigned_pool.remove(ln)
+        added.append(ln)
+    return added
+
+
+PACK_STRATEGIES = ["length", "height", "weight", "volume"] + ["seed%d" % i for i in range(1, 25)]
+
+
+def optimize_load_packing(load, pins=None):
+    """Search over packing orders (a few deterministic heuristics plus
+    seeded shuffles) for the arrangement that places the most bundles --
+    ties broken by most volume on board, then best floor use. Honours any
+    pinned bundles. Updates the load in place; returns (strategy, packing
+    improved: bool)."""
+    def score(packing, leftover):
+        placed_vol = sum(t["used_volume"] for t in packing.values())
+        floor = sum(t["used_length"] for t in packing.values())
+        return (len(leftover), -placed_vol, -floor)
+
+    best = None
+    for strat in PACK_STRATEGIES:
+        packing, leftover = pack_load(load, pins=pins, unit_sort=strat)
+        s = score(packing, leftover)
+        if best is None or s < best[0]:
+            best = (s, strat, packing, leftover)
+    cur_left = len(load.get("pack_leftover") or [])
+    cur_vol = sum(t["used_volume"] for t in (load.get("packing") or {}).values())
+    _, strat, packing, leftover = best
+    improved = (len(leftover) < cur_left) or (
+        len(leftover) == cur_left and sum(t["used_volume"] for t in packing.values()) > cur_vol + 1e-9)
+    load["packing"] = packing
+    load["pack_leftover"] = leftover
+    load["pack_strategy"] = strat
+    return strat, improved
 
 
 if __name__ == "__main__":
