@@ -10,21 +10,22 @@ import tempfile
 
 import streamlit as st
 import openpyxl
+import pandas as pd
 
 import load_builder as lb
 from build_outputs import (write_loads_summary, write_orders_summary,
                            write_schematics_pdf, write_transport_orders,
                            default_schedule_cfg, DAY_ABBR)
 
-APP_VERSION = "v37 (17 Jul 2026)"
+APP_VERSION = "v38 (17 Jul 2026)"
 
 st.set_page_config(page_title="Load Builder", layout="wide")
 st.title("Load Builder")
 lb_ver = getattr(lb, "LB_VERSION", "v31 or older")
-if lb_ver != "v37":
-    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v37. "
+if lb_ver != "v38":
+    st.error(f"FILE MISMATCH: load_builder.py on GitHub is {lb_ver}, but this app expects v38. "
              "Re-upload load_builder.py and reboot the app.")
-st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v37, otherwise a file on GitHub is outdated.")
+st.caption(f"Upload your orders/customers/SKU/truck workbook, set your parameters, and build loads.  \n**Build {APP_VERSION}, engine {lb_ver}** -- both must say v38, otherwise a file on GitHub is outdated.")
 
 with st.sidebar:
     st.header("Parameters")
@@ -120,9 +121,10 @@ with st.sidebar:
     st.subheader("Fleet available (number of trucks)")
     lb.TRUCK_TYPES["34T"]["fleet_count"] = st.number_input("34 Ton Tautliner", min_value=0, value=20)
     lb.TRUCK_TYPES["FD"]["fleet_count"] = st.number_input(
-        "Flat Deck", min_value=0, value=0,
-        help=("Dimensions/capacity come from the 'Flat Deck' column in the uploaded Truck "
-              "Dimensions tab if present, otherwise a placeholder spec is used. Set to 0 if you "
+        "34 Ton Flat Deck", min_value=0, value=0,
+        help=("Dimensions/capacity come from the matching column in the uploaded Truck "
+              "Dimensions tab if present (matched on the word 'flat' in the header, whatever "
+              "the exact tonnage/name), otherwise a placeholder spec is used. Set to 0 if you "
               "don't have any."))
     lb.TRUCK_TYPES["30T"]["fleet_count"] = st.number_input("30 Ton Tri Axle Tautliner", min_value=0, value=0)
     lb.TRUCK_TYPES["14T"]["fleet_count"] = st.number_input("14 Ton Tautliner", min_value=0, value=0)
@@ -139,6 +141,19 @@ with st.sidebar:
 
 uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 
+# Cache the uploaded bytes into session_state as soon as a file lands, and
+# use THAT (not the live `uploaded` widget value) for everything below.
+# file_uploader's return value can go back to None on a rerun it wasn't
+# itself the trigger for (this has been observed after other widgets --
+# e.g. a download button -- cause a rerun); if the rest of the app depended
+# on `uploaded` directly, that alone would make the whole page collapse
+# back to "upload to get started" even though a file was clearly already
+# provided. Caching decouples the two.
+if uploaded is not None:
+    st.session_state["uploaded_bytes"] = uploaded.getvalue()
+    st.session_state["uploaded_name"] = uploaded.name
+have_file = "uploaded_bytes" in st.session_state
+
 # Build results live in session_state, NOT inside the button's if-block --
 # in Streamlit, EVERY widget interaction (including clicking a button
 # further down the page) reruns the whole script, and a plain
@@ -148,10 +163,11 @@ uploaded = st.file_uploader("Input workbook (.xlsx)", type=["xlsx"])
 # and the entire page would appear to reset. Storing the result means it
 # keeps rendering on every later rerun until a new "Build Loads" click
 # replaces it.
-if uploaded is not None and st.button("Build Loads", type="primary"):
+if have_file and st.button("Build Loads", type="primary"):
     with st.spinner("Building loads..."):
         try:
-            sites, customers, skus, orders, excluded = lb.load_workbook_data(uploaded)
+            sites, customers, skus, orders, excluded = lb.load_workbook_data(
+                io.BytesIO(st.session_state["uploaded_bytes"]))
         except ValueError as e:
             st.error(f"Problem with the uploaded workbook: {e}")
             st.stop()
@@ -178,6 +194,7 @@ if uploaded is not None and st.button("Build Loads", type="primary"):
         "lines": lines, "sites": sites, "excluded": excluded,
         "build_everything": build_everything,
     }
+    st.session_state["truck_overrides"] = {}  # fresh load IDs -- clear any stale overrides
 
 if "result" in st.session_state:
     res = st.session_state["result"]
@@ -188,6 +205,10 @@ if "result" in st.session_state:
     sites = res["sites"]
     excluded = res["excluded"]
     build_everything_used = res["build_everything"]
+
+    if "rebuild_message" in st.session_state:
+        kind, msg = st.session_state.pop("rebuild_message")
+        getattr(st, kind)(msg)
 
     st.success(f"Built {len(loads)} loads from {len(lines)} delivery lines "
                f"({excluded} collects excluded). {len(unassigned)} lines could not be placed.")
@@ -214,7 +235,8 @@ if "result" in st.session_state:
         spec = lb.TRUCK_TYPES[load["truck_type"]]
         total_bundles = sum(ln["bundles"] for ln in load["lines"])
         rows.append({
-            "Load ID": load["load_id"], "Site": load["site"], "Truck": load["truck_type"],
+            "Load ID": load["load_id"], "Site": load["site"],
+            "Truck": lb.truck_display_name(load["truck_type"]),
             "Group": lb.group_label(load["group"]), "m3": round(load["total_m3"], 1),
             "Vol Util %": round(load["total_m3"] / spec["cube_cap_m3"] * 100),
             "KG": round(load["total_kg"]),
@@ -229,13 +251,38 @@ if "result" in st.session_state:
     st.caption(
         "Set a different truck type for as many loads as you like below, then click 'Rebuild with "
         "these truck types' once -- it re-simulates packing for every changed load and updates the "
-        "table above and both downloads below in one go. Nothing changes until you click Rebuild."
+        "table above and both downloads below in one go. Nothing changes until you click Rebuild. "
+        "Every truck type is selectable here regardless of the fleet count set in the sidebar -- "
+        "that count only controls how many of each type the automatic build assumes are available."
     )
-    truck_options = list(lb.TRUCK_TYPES.keys())
-    override_rows = [{"Load ID": l["load_id"], "Site": l["site"], "Truck type": l["truck_type"]}
-                      for l in loads]
-    edited = st.data_editor(
-        override_rows,
+    # Show/store DISPLAY NAMES in the editor (e.g. "34 Ton Flat Deck") but
+    # translate back to the internal key ("FD") when applying the rebuild.
+    key_to_display = {k: lb.truck_display_name(k) for k in lb.TRUCK_TYPES}
+    display_to_key = {v: k for k, v in key_to_display.items()}
+    truck_options = list(key_to_display.values())
+
+    # IMPORTANT: st.data_editor's own "edited_rows" tracking is a ONE-SHOT
+    # delta -- it reflects an edit only on the exact rerun where that edit
+    # happened, and is silently cleared on any LATER rerun (even one with no
+    # new interaction at all, e.g. clicking the Rebuild button below). If we
+    # rebuilt the editor's input fresh from `loads` every run and only read
+    # its return value when Rebuild was clicked, any selection made here
+    # would appear to work, then do nothing once Rebuild was actually
+    # pressed -- exactly what was reported. So we persist the user's choices
+    # into our OWN session_state immediately, and feed that back in as the
+    # editor's baseline on every run, instead of trusting the widget to
+    # remember it for us.
+    if "truck_overrides" not in st.session_state:
+        st.session_state["truck_overrides"] = {}
+    overrides = st.session_state["truck_overrides"]
+
+    override_df = pd.DataFrame([
+        {"Load ID": l["load_id"], "Site": l["site"],
+         "Truck type": key_to_display[overrides.get(l["load_id"], l["truck_type"])]}
+        for l in loads
+    ])
+    edited_df = st.data_editor(
+        override_df,
         column_config={
             "Load ID": st.column_config.TextColumn("Load ID", disabled=True),
             "Site": st.column_config.TextColumn("Site", disabled=True),
@@ -243,8 +290,11 @@ if "result" in st.session_state:
         },
         hide_index=True, width="stretch", key="truck_override_editor",
     )
+    for _, r in edited_df.iterrows():
+        overrides[r["Load ID"]] = display_to_key.get(r["Truck type"], r["Truck type"])
+
     if st.button("Rebuild with these truck types"):
-        id_to_truck = {r["Load ID"]: r["Truck type"] for r in edited}
+        id_to_truck = dict(st.session_state["truck_overrides"])
         warnings = []
         for load in loads:
             new_truck = id_to_truck.get(load["load_id"], load["truck_type"])
@@ -253,14 +303,19 @@ if "result" in st.session_state:
             load["packing"] = packing
             load["pack_leftover"] = leftover
             if leftover:
-                warnings.append((load["load_id"], new_truck, len(leftover)))
+                warnings.append((load["load_id"], lb.truck_display_name(new_truck), len(leftover)))
         st.session_state["result"]["loads"] = loads
+        # NOTE: st.rerun() below immediately aborts this script run, so any
+        # st.success/st.warning called here would never actually reach the
+        # browser -- stash the message and show it after the rerun instead.
         if warnings:
             details = "; ".join(f"{lid} on {t}: {n} bundle(s) would not fit" for lid, t, n in warnings)
-            st.warning(f"Rebuilt -- but some bundles no longer physically fit: {details}. "
-                       "Consider a bigger truck for those loads, or move some freight to another load.")
+            st.session_state["rebuild_message"] = ("warning",
+                f"Rebuilt -- but some bundles no longer physically fit: {details}. "
+                "Consider a bigger truck for those loads, or move some freight to another load.")
         else:
-            st.success("Rebuilt -- every bundle still physically fits with your chosen truck types.")
+            st.session_state["rebuild_message"] = ("success",
+                "Rebuilt -- every bundle still physically fits with your chosen truck types.")
         st.rerun()
 
     wb = openpyxl.Workbook()
@@ -287,5 +342,5 @@ if "result" in st.session_state:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     dcol2.download_button("Download Load Schematics.pdf", pdf_bytes,
                            file_name="Load Schematics.pdf", mime="application/pdf")
-elif uploaded is None:
+elif not have_file:
     st.info("Upload your workbook above to get started.")
